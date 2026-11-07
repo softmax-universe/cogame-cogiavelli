@@ -24,7 +24,7 @@
         "/bin/cogiavelli"
       ],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-cogiavelli/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main"
     },
     "config_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -315,7 +315,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cogiavelli/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main"
     },
     {
       "id": "cogiavelli-condottiere",
@@ -338,7 +338,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cogiavelli/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main"
     },
     {
       "id": "cogiavelli-banker",
@@ -361,7 +361,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-cogiavelli/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main"
     }
   ],
   "variants": [
