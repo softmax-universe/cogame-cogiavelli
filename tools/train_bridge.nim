@@ -108,7 +108,8 @@ proc encode(): JsonNode =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
+  let action = if languageMode: extractJsonObject(command["response"].getStr())
+    else: parseJson(command["response"].getStr())
   let seat = seats[index]
   let decision = if languageMode:
     if snapshot.phase == phPress: parsePress(snapshot, seat, action)

@@ -695,23 +695,27 @@ proc commonBlock(sim: Sim, power: int): string =
 
 proc pressPrompt*(sim: Sim, seat: int, prompt: string): string =
   let power = sim.powerOf[seat]
+  let rival = PowerNames[(power + 1) mod Powers]
   result.add(seasonName(sim.season) & " " & $sim.year & " \u2014 LETTERS.\n\n")
   result.add(sim.commonBlock(power))
   result.add("YOUR NOTES:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY {\"broadcast\":\"\u2026\",\"letters\":" &
-    "[{\"to\":\"MILAN\",\"text\":\"\u2026\"}],\"pledges\":" &
-    "[{\"to\":\"MILAN\",\"kind\":\"peace\"}],\"notes\":\"\u2026\"} \u2014 " &
-    "broadcast at most " & $MaxBroadcastLen & " characters, at most " &
-    $MaxLetters & " letters of at most " & $MaxLetterLen &
-    " characters each (one per power), at most " & $MaxPledges &
-    " pledges, notes at most " & $MaxNotesLen &
-    " characters. A pledge is the only promise spectators can watch you " &
-    "break; free text is never checked.")
+  result.add("Reply with ONLY one JSON object:\n" &
+    "{\"broadcast\":\"\u2026\",\"letters\":[{\"to\":\"" & rival &
+    "\",\"text\":\"\u2026\"}],\"pledges\":[{\"to\":\"" & rival &
+    "\",\"kind\":\"peace\"}],\"notes\":\"\u2026\"}\n" &
+    "- broadcast: public message (<= " & $MaxBroadcastLen &
+    " chars; \"\" for silence).\n" &
+    "- letters: <= " & $MaxLetters & " private letters (<= " & $MaxLetterLen &
+    " chars each, at most one per rival power; [] if none).\n" &
+    "- pledges: <= " & $MaxPledges & " nonbinding spectator-tracked promises " &
+    "(kind: peace, support, or keepout with \"province\":\"ROM\"; [] if none).\n" &
+    "- notes: private memory for next phase (<= " & $MaxNotesLen & " chars).")
 
 proc ordersPrompt*(sim: Sim, seat: int, prompt: string): string =
   let power = sim.powerOf[seat]
+  let buildsField = if sim.season == seAutumn: ",\"builds\":[]" else: ""
   result.add(seasonName(sim.season) & " " & $sim.year &
     " \u2014 ORDERS AND EXPENDITURE.\n\n")
   result.add(sim.commonBlock(power))
@@ -723,36 +727,73 @@ proc ordersPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("YOUR NOTES:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY {\"orders\":[\"A VER - MAN\"," &
-    "\"F VEN S A VER - MAN\"],\"spend\":[{\"action\":\"bribe_buy\"," &
-    "\"target\":\"A ROM\",\"amount\":15}],\"notes\":\"\u2026\"} \u2014 " &
-    "exactly one order per unit, copied character for character from the " &
-    "list above; an order that is not on the list becomes a hold. spend " &
-    "is at most " & $MaxSpendEntries & " entries; action is one of gift, " &
-    "bribe_disband, bribe_buy, defend, assassinate; target is a power " &
-    "name for gift and assassinate and a unit like \"A ROM\" for the " &
-    "others; amount is a whole number of ducats you actually have. " &
-    "Anything you cannot afford is dropped, in the order you wrote it.")
-  if sim.season == seAutumn:
-    result.add("\nYou may also send \"builds\":[\"A VEN\",\"F PAL\"] \u2014 " &
-      "up to " & $MaxBuilds & " entries, " & $BuildCost &
-      " ducats each, executed this Winter in a vacant city you own; a " &
-      "fleet only in a coastal city.")
+  result.add("Reply with ONLY one JSON object:\n" &
+    "{\"orders\":[\"A VER - MAN\",\"F VEN S A VER - MAN\"],\"spend\":[]" &
+    buildsField & ",\"notes\":\"\u2026\"}\n" &
+    "- orders: one string per unit, copied verbatim from YOUR UNITS above " &
+    "(unlisted orders become holds).\n" &
+    "- spend: <= " & $MaxSpendEntries & " entries of " &
+    "{\"action\":\"gift|bribe_disband|bribe_buy|defend|assassinate\"," &
+    "\"target\":\"<POWER or unit like A ROM>\",\"amount\":<int>} " &
+    "(target is a power name for gift/assassinate, a unit for bribe_*/defend; " &
+    "unaffordable entries are dropped in order).\n" &
+    (if sim.season == seAutumn:
+      "- builds: <= " & $MaxBuilds & " entries like \"A VEN\" or \"F PAL\" (" &
+      $BuildCost & " ducats each this Winter in vacant owned cities; fleets coastal only).\n"
+     else: "") &
+    "- notes: private memory for next phase (<= " & $MaxNotesLen & " chars).")
 
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating
-  ## fences and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(CogiavelliError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  ## Pulls the first balanced {...} object out of a model response, tolerating
+  ## a UTF-8 BOM, markdown fences, and trailing prose containing braces.
+  var body = strutils.strip(text)
+  if body.len >= 3 and body[0 .. 2] == "\xEF\xBB\xBF":
+    body = strutils.strip(body[3 .. ^1])
+  if body.startsWith("```"):
+    let firstBreak = body.find('\n')
+    if firstBreak >= 0:
+      body = body[firstBreak + 1 .. ^1]
+    else:
+      body = body[3 .. ^1]
+    let closing = body.rfind("```")
+    if closing >= 0:
+      body = body[0 ..< closing]
+    body = strutils.strip(body)
+  let start = body.find('{')
+  if start < 0:
+    let head = cleanText(body.replace("\n", " "), 160)
+    raise newException(CogiavelliError, "no JSON object in response: " & head)
+  var depth = 0
+  var inString = false
+  var escaped = false
+  var stop = -1
+  for index in start ..< body.len:
+    let ch = body[index]
+    if inString:
+      if escaped:
+        escaped = false
+      elif ch == '\\':
+        escaped = true
+      elif ch == '"':
+        inString = false
+      continue
+    case ch
+    of '"': inString = true
+    of '{': depth += 1
+    of '}':
+      depth -= 1
+      if depth == 0:
+        stop = index
+    else: discard
+    if stop >= 0:
+      break
+  if stop < 0:
+    let head = cleanText(body.replace("\n", " "), 160)
+    raise newException(CogiavelliError,
+      "unbalanced JSON object in response: " & head)
+  parseJson(body[start .. stop])
 
 proc parsePress*(sim: Sim, seat: int, payload: JsonNode): Decision =
   ## A reply is invalid only when it is not an object or carries neither
