@@ -201,9 +201,40 @@ block replyParsing:
   let press = parsePress(sim, seat, extractJsonObject(fenced))
   check(press.broadcast == "peace", "fenced JSON is accepted")
 
+  let bomAndBraces = "\xEF\xBB\xBF```json\n" &
+    "{\"broadcast\": \"hold {VEN} and \\\"}\\\"\", \"notes\": \"plan {1}\"}\n```\n" &
+    "Trailing commentary with {braces} and extra }."
+  let pressBom = parsePress(sim, seat, extractJsonObject(bomAndBraces))
+  check(pressBom.broadcast == "hold {VEN} and \"}\"",
+    "BOM, fences, escaped quotes/braces, and trailing {braces} are handled")
+  check(pressBom.notes == "plan {1}",
+    "notes survive trailing braces outside the first object")
+
   let prose = "Here is my move.\n{\"orders\": [\"A VER H\"]}\nThat is all."
   var orders = parseOrdersReply(sim, seat, extractJsonObject(prose))
   check(orders.orders == @["A VER H"], "prose-wrapped JSON is accepted")
+
+  for pad in 150 .. 165:
+    let nonJson = "Refusal " & repeat("a", pad) & "é tail"
+    var utf8Ok = false
+    try:
+      discard extractJsonObject(nonJson)
+    except CogiavelliError as error:
+      utf8Ok = validateUtf8(error.msg) == -1
+    check(utf8Ok, "no-JSON error preview is cut on a rune boundary")
+
+  var unbalanced = false
+  try:
+    discard extractJsonObject("{\"orders\": [\"A VER H\"]")
+  except CogiavelliError:
+    unbalanced = true
+  check(unbalanced, "an unbalanced JSON object raises CogiavelliError")
+
+  for s in 0 ..< Seats:
+    let power = PowerNames[sim.powerOf[s]]
+    let pressText = pressPrompt(sim, s, "")
+    check("{\"to\":\"" & power & "\"" notin pressText,
+      "pressPrompt sample letter never targets the acting power itself")
 
   var raised = false
   try:
