@@ -11,8 +11,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+FAILURE_SLOTS = {"2", "4"}
 
 
 def make_provider(mode: str, call_log: list):
@@ -32,19 +36,17 @@ def make_provider(mode: str, call_log: list):
             assert "PRIVATE_OPERATOR_" + slot in user
             assert all("PRIVATE_OPERATOR_" + str(i) not in user for i in range(6) if str(i) != slot)
             assert "SPECTATOR_POLICY_" not in user and "SPECTATOR_POLICY_" not in body["system"]
-            if mode == "http_error":
-                self.send_error(503, "FIXTURE_PROVIDER_UNAVAILABLE")
+            fail_slot = slot in FAILURE_SLOTS
+            if fail_slot and mode == "http_error":
+                self.send_error(503, f"FIXTURE_PROVIDER_UNAVAILABLE_{slot}")
                 return
-            if mode == "disconnect":
+            if fail_slot and mode == "disconnect":
                 self.close_connection = True
                 return
-            retry = "Your previous reply was invalid" in user
-            if mode == "always_invalid":
-                text = "HTTP 503: RAW_INVALID_MODEL_OUTPUT_12345"
-            elif mode == "illegal_order" and " — LETTERS." not in user:
+            if fail_slot and mode == "always_invalid":
+                text = f"HTTP 503: RAW_INVALID_MODEL_OUTPUT_12345_{slot}"
+            elif fail_slot and mode == "illegal_order" and " — LETTERS." not in user:
                 text = json.dumps({"orders": ["A NOT_A_PROVINCE - NOPE"], "spend": [], "notes": "bad"})
-            elif year == "1499" and season == "SPRING" and not retry:
-                text = "invalid fixture reply on first attempt"
             else:
                 notes = "PRIVATE_CAPTURE_" + slot
                 if " — LETTERS." in user:
@@ -54,14 +56,15 @@ def make_provider(mode: str, call_log: list):
                         "pledges": [],
                         "notes": notes,
                     }
-                    text = f"```json\n{json.dumps(action)}\n```" if retry else json.dumps(action)
                 else:
                     legal = user.split("YOUR UNITS AND EVERY LEGAL ORDER:\n")[1].split("\n\n")[0]
                     orders = re.findall(r"^  [AF] [A-Z]+ \([^\n]*?\): ([^|\n]+)", legal, re.M)
                     action = {"orders": [o.strip() for o in orders], "spend": [], "notes": notes}
                     if season == "AUTUMN":
                         action["builds"] = []
-                    text = f"```json\n{json.dumps(action)}\n```" if retry else json.dumps(action)
+                text = json.dumps(action)
+                if season == "SPRING":
+                    text = f"```json\n{text}\n```"
             response = json.dumps(
                 {
                     "model": body["model"],
@@ -165,12 +168,14 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+        model_seats = [i for i, role in enumerate(seat_roles) if not role]
         if expected_kind:
             assert rc != 0, f"expected non-zero exit for {name}, got 0"
             assert not (root / "results.json").exists(), f"failed episode must not write fake results.json in {name}"
             failure = json.loads((root / "player_failure.json").read_text())
             assert set(failure.keys()) == {"failed_policy_index", "kind", "message"}, failure
-            assert failure["failed_policy_index"] == 0 and failure["kind"] == expected_kind, failure
+            failed_seat = 2 if model_enabled else model_seats[0]
+            assert failure["failed_policy_index"] == failed_seat and failure["kind"] == expected_kind, failure
             assert failure["message"]
             if provider_mode == "always_invalid":
                 assert "RAW_INVALID_MODEL_OUTPUT_12345" in failure["message"]
@@ -178,15 +183,40 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
                 assert "A NOT_A_PROVINCE - NOPE" in failure["message"]
             elif provider_mode == "http_error":
                 assert "503" in failure["message"] and "FIXTURE_PROVIDER_UNAVAILABLE" in failure["message"]
-            assert bool(call_log) == model_enabled
+            expected_calls = [(str(i), "1499", "SPRING", config["press"]) for i in model_seats] if model_enabled else []
+            observed = Counter(call_log)
+            if provider_mode == "disconnect":
+                # libcurl may resend on a fresh connection after a pooled socket closes
+                # before any response. Only the interrupted seat can reach the handler twice.
+                interrupted = (str(failed_seat), "1499", "SPRING", config["press"])
+                assert observed[interrupted] in (1, 2), call_log
+                observed[interrupted] = 1
+            assert observed == Counter(expected_calls), call_log
             if capture:
                 rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"
                 assert "scores" not in rows[-1]["outcome"] and rows[-1]["participant_outcomes"] == {}
                 if provider_mode == "http_error":
                     assert "FIXTURE_PROVIDER_UNAVAILABLE" in rows[-1]["outcome"]["raw_response"]
-                assert rows[-2]["action_status"] == "rejected"
-                assert all(a["origin"] == "model" and not a["accepted"] for a in rows[-2]["attempts"])
+                assert rows[-1]["outcome"]["seat"] == failed_seat
+                assert sorted(int(row["seat"]) for row in rows[:-1]) == model_seats
+                for row in rows[:-1]:
+                    slot = row["seat"]
+                    assert row["executed_action"] is None and row["selected_attempt_id"] is None
+                    attempt, = row["attempts"]
+                    assert attempt["policy"] == "SPECTATOR_POLICY_" + slot and attempt["origin"] == "model"
+                    if model_enabled:
+                        assert "PRIVATE_OPERATOR_" + slot in attempt["request"]["messages"][0]["content"]
+                    if not model_enabled or slot in FAILURE_SLOTS:
+                        assert row["action_status"] == "rejected" and not attempt["accepted"]
+                        assert attempt["rejection_reason"]
+                        if provider_mode == "always_invalid":
+                            assert f"RAW_INVALID_MODEL_OUTPUT_12345_{slot}" in attempt["response"]
+                        elif provider_mode == "http_error":
+                            assert f"FIXTURE_PROVIDER_UNAVAILABLE_{slot}" in attempt["raw_response"]
+                    else:
+                        assert row["action_status"] == "missing" and attempt["accepted"]
+                        assert attempt["parsed_action"]["notes"] == "PRIVATE_CAPTURE_" + slot
             return failure, call_log
 
         assert rc == 0, f"game failed unexpectedly ({rc}); see {root / 'game.log'}"
@@ -195,22 +225,21 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
         replay = json.loads((root / "replay.json").read_text())
         assert results["reason"] in ("complete", "conquest")
         assert len(results["scores"]) == seats
-        model_seats = [i for i, r in enumerate(seat_roles) if not r]
-        if model_seats:
-            assert len(call_log) > 0, "model seat must actually call HTTP"
-            assert {int(c[0]) for c in call_log} == set(model_seats)
-            if variant["id"] == "standard":
-                # Verify the model's returned broadcast was actually applied into the replay!
-                broadcasts = [e["broadcast"] for e in replay["events"] if e["kind"] == "press" and e["seat"] == 0]
-                assert any(b.startswith("PUBLIC_PHASE_1499_spring_0") for b in broadcasts), broadcasts
-        else:
-            assert len(call_log) == 0, "explicit baseline-only game must not call HTTP"
+        events = [e for e in replay["events"] if e["kind"] in ("press", "orders")]
+        expected_calls = []
+        for event in events:
+            if event["seat"] in model_seats:
+                slot, year, season = str(event["seat"]), str(event["year"]), event["season"]
+                expected_calls.append((slot, year, season.upper(), event["kind"] == "press"))
+                if event["kind"] == "press":
+                    assert event["broadcast"] == f"PUBLIC_PHASE_{year}_{season.lower()}_{slot}"
+        assert Counter(call_log) == Counter(expected_calls), call_log
+        assert set(int(call[0]) for call in call_log) == set(model_seats)
         if capture:
             trace = root / "trajectory.jsonl"
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
             assert trace.stat().st_mode & 0o077 == 0
             assert rows[-1]["status"] == "completed" and rows[-1]["outcome"] == results
-            events = [event for event in replay["events"] if event["kind"] in ("press", "orders")]
             assert len(events) == len(rows) - 1
             for event, row in zip(events, rows[:-1], strict=True):
                 assert event["seat"] == int(row["seat"])
@@ -218,9 +247,19 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
                 if seat_roles[event["seat"]]:
                     assert row["attempts"][0]["origin"] == "unknown"
                 else:
-                    assert all(a["origin"] == "model" for a in row["attempts"])
-                    assert row["attempts"][-1]["accepted"]
-                    assert row["attempts"][-1]["platform_call_id"] is not None
+                    attempt, = row["attempts"]
+                    assert attempt["origin"] == "model" and attempt["accepted"]
+                    assert row["selected_attempt_id"] == attempt["attempt_id"]
+                    assert attempt["parsed_action"] == row["executed_action"]
+                    assert attempt["platform_call_id"] is not None
+                    text = attempt["response"]
+                    if event["season"].lower() == "spring":
+                        assert text.startswith("```json\n") and text.endswith("\n```")
+                        text = text[8:-4]
+                    action = json.loads(text)
+                    assert action["notes"] == "PRIVATE_CAPTURE_" + row["seat"]
+                    field = "orders" if event["kind"] == "orders" else "broadcast"
+                    assert action[field] == event[field]
         return results, replay
     finally:
         provider.shutdown()
@@ -242,7 +281,7 @@ def main():
     game, player, destination = map(lambda value: Path(value).resolve(), sys.argv[1:])
     destination.mkdir(mode=0o700, exist_ok=False)
     manifest = json.loads((Path(__file__).resolve().parents[1] / "coworld_manifest_template.json").read_text())
-    mixed_roles = ["", "condottiere", "banker", "condottiere", "banker", "condottiere"]
+    mixed_roles = ["", "condottiere", "", "banker", "", ""]
     baseline_roles = ["condottiere", "banker", "condottiere", "banker", "condottiere", "banker"]
 
     # 1. Model player vs explicit baseline opponents (both variants, capture on/off parity)
@@ -251,7 +290,7 @@ def main():
         ordinary = run(game, player, destination, variant, f"{variant['id']}-model-plain", False, mixed_roles)
         assert captured == ordinary, "capture changed the native outcome or replay"
 
-    # 2. Explicit failure when model returns invalid output twice (preserves raw data, no fallback)
+    # 2. Explicit failure when model returns invalid output (preserves raw data, no fallback)
     run(game, player, destination, manifest["variants"][0], "fail-invalid-reply", True, mixed_roles,
         provider_mode="always_invalid", expected_kind="player_error")
 
@@ -271,7 +310,7 @@ def main():
     run(game, player, destination, manifest["variants"][0], "baselines-offline", True, baseline_roles,
         model_enabled=False)
 
-    print("native server/player verification passed: HTTP model vs baselines, retries, explicit failures, offline baselines")
+    print("native server/player verification passed: HTTP model vs baselines, one call per decision, attributed failures, offline baselines")
 
 
 if __name__ == "__main__":

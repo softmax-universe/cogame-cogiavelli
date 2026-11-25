@@ -20,7 +20,7 @@ import
 
 const DefaultPrompt = """
 Take the neutral cities first and hold them with a unit inside, because an
-empty city rebels. Keep a reserve of at least fifteen ducats: a bribe that
+empty city may rebel. Keep a reserve of at least fifteen ducats: a bribe that
 buys a neighbour's army at the right moment is worth two campaigns, and a
 defended unit is cheaper than a lost one. Promise peace to the strongest
 power and mean it until you can afford not to.

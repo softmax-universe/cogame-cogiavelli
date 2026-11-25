@@ -30,7 +30,7 @@ const
   MaxPledges* = 4
   MaxNotesLen* = 800
   MaxOrderLen* = 40
-  MaxOrders* = 24
+  MaxOrders* = NumAreas  ## One order for every possible occupied province.
   MaxSpendEntries* = 6
   MaxBuilds* = 6
   MaxBuildLen* = 24

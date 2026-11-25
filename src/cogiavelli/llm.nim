@@ -9,8 +9,8 @@
 ## requests as ONE `curly.makeRequests` batch — never seat by seat.
 ## Explicitly scripted seats (`PLAYER_SCRIPTED=condottiere|banker`) run
 ## deterministically without an LLM. Model seats (`skNone`) require a
-## configured LLM transport; invalid or failed model replies are retried
-## once and then fail the episode explicitly with no scripted fallback.
+## configured LLM transport. Each gets one request per decision. An invalid
+## or unavailable response fails the episode after the batch is collected.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -30,8 +30,6 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
-  InvalidHint = "\nYour previous reply was invalid. Respond with ONLY the " &
-    "requested JSON object."
 
 type
   ScriptKind* = enum
@@ -83,8 +81,6 @@ type
     apiKey: string
     sidecarEndpoint: string
     bedrockEndpoint: string
-    bedrockModels: seq[string]
-    bedrockModel: int
     bedrockToken: string
     model: string
     maxOutputTokens: int
@@ -134,33 +130,9 @@ proc resolveApiKey(): string =
     echo "cogiavelli llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. Haiku leads: hosted Bedrock capacity is
-  ## shared account-wide and the sonnet profiles run out first.
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "cogiavelli llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
 proc bedrockUrl(client: LlmClient): string =
   client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+    client.model & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -184,7 +156,9 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.model = getEnv("BEDROCK_MODEL").strip()
+    if result.model.len == 0:
+      result.model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "cogiavelli llm: bedrock transport, url ", result.bedrockUrl
@@ -631,10 +605,11 @@ proc shockText(sim: Sim): string =
     return "(nothing yet)"
   parts.join("\n")
 
-proc legalOrderText(sim: Sim, power: int): string =
+proc legalOrderText(sim: Sim, power: int, example: var seq[string]): string =
   var lines: seq[string]
   for unit in sim.myUnits(power):
     let options = legalOrders(sim.board, unit.province)
+    example.add(if example.len == 0 and options.len > 1: options[1] else: options[0])
     lines.add("  " & unitText(unit) & " (" & Provinces[unit.province].name &
       "): " & options.join(" | "))
   if lines.len == 0:
@@ -670,25 +645,21 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   let power = sim.powerOf[seat]
   selection.introduction(PowerNames[power], otherPowersText(power)) & """
 Rules:
-""" & selection.warfareBriefing() & """- Whoever occupies a city owns it, from that moment. Cities pay 3 ducats each every
-  Winter; every unit costs 1 ducat of upkeep; a new unit costs 3 ducats and appears in a
-  vacant city you own.
-- DUCATS ARE THE OTHER ARMY. In the same submission as your orders you may: GIFT ducats
-  to another power (they arrive, always — this is the only promise in the game that
-  cannot be broken); BRIBE an enemy unit to disband (9 ducats) or to change sides and
-  serve you (15 ducats); DEFEND one of your own units against bribery (every ducat you
-  pay raises what a briber must beat); or ASSASSINATE a rival, paying 6 to 30 ducats for
-  a roll of two dice — beat the roll and that power's whole court freezes: every one of
-  its units holds this season and it sends no letters the next. Money resolves BEFORE the
-  armies move, and it is spent whether or not it works. Everything you pay is published.
+""" & selection.warfareBriefing() & """- Occupying a city gives you ownership immediately. Each Winter, cities unaffected by
+  famine or plague pay 3 ducats each, and each power draws 0 to 3 additional ducats.
+  Unit upkeep costs 1 ducat each. A new unit costs 3 ducats and appears in a vacant city you own.
+- Money resolves before movement. GIFT transfers ducats to another power. BRIBE an enemy
+  unit to disband (9 ducats) or change sides (15 ducats). Each ducat spent on DEFEND raises
+  both bribe prices for that unit by one. ASSASSINATE costs 6 to 30 ducats and succeeds
+  when a uniform roll from 1 to 36 is at most the amount paid. The target's units hold
+  this season and it sends no letters the next. Paid amounts are public and spent even
+  when an attempt fails.
 - Italy bites back: famine marks two provinces each Spring and starves whatever still
   stands there at Winter, plague empties one city every Summer, and a city you own with
   no unit in it may rebel and be lost.
 - Hold 12 of the 24 cities and you win outright. Otherwise you are scored on your share
   of the 24 cities plus what is left in your treasury. Nothing else scores.
-""" & selection.diplomacyBriefing() & """OUTPUT FORMAT: reply with ONLY one JSON object, nothing else — no analysis, no
-explanation, no markdown fences, no text before or after the object. Your reply must
-begin with the character { and end with }."""
+""" & selection.diplomacyBriefing() & """Reply with one JSON object, optionally inside a JSON code fence."""
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -714,7 +685,7 @@ proc pressPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("YOUR NOTES:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY one JSON object:\n" &
+  result.add("Example reply:\n" &
     "{\"broadcast\":\"\u2026\",\"letters\":[{\"to\":\"" & rival &
     "\",\"text\":\"\u2026\"}],\"pledges\":[{\"to\":\"" & rival &
     "\",\"kind\":\"peace\"}],\"notes\":\"\u2026\"}\n" &
@@ -729,26 +700,25 @@ proc pressPrompt*(sim: Sim, seat: int, prompt: string): string =
 proc ordersPrompt*(sim: Sim, seat: int, prompt: string): string =
   let power = sim.powerOf[seat]
   let buildsField = if sim.season == seAutumn: ",\"builds\":[]" else: ""
-  var exampleOrders = newJArray()
-  for unit in sim.myUnits(power):
-    let options = legalOrders(sim.board, unit.province)
-    if options.len > 0:
-      let pick = if exampleOrders.len == 0 and options.len > 1: options[1]
-                 else: options[0]
-      exampleOrders.add(%pick)
+  var exampleOrders: seq[string]
   result.add(seasonName(sim.season) & " " & $sim.year &
     " \u2014 ORDERS AND EXPENDITURE.\n\n")
   result.add(sim.commonBlock(power))
   result.add("YOUR TREASURY: " & $sim.treasury[power] & " ducats.\n\n")
+  result.add("A direct move needs an adjacent destination. VIA CONVOY is for army moves. " &
+    "A convoyed move needs a chain of fleets already at sea, each ordered to convoy that army " &
+    "to its destination. To support a move, you must border its destination. Copy the " &
+    "support order as printed, even when the army moves by convoy. A legal order can " &
+    "fail at resolution.\n\n")
   result.add("YOUR UNITS AND EVERY LEGAL ORDER:\n" &
-    sim.legalOrderText(power) & "\n\n")
+    sim.legalOrderText(power, exampleOrders) & "\n\n")
   result.add("UNITS YOU COULD BRIBE THIS SEASON:\n" &
     sim.bribeMenuText(power) & "\n\n")
   result.add("YOUR NOTES:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY one JSON object:\n" &
-    "{\"orders\":" & $exampleOrders & ",\"spend\":[]" &
+  result.add("Example reply:\n" &
+    "{\"orders\":" & $(%exampleOrders) & ",\"spend\":[]" &
     buildsField & ",\"notes\":\"\u2026\"}\n" &
     "- orders: one string per unit you own, copied verbatim from YOUR UNITS above " &
     "([] only if you have no units).\n" &
@@ -964,11 +934,13 @@ proc parseOrdersReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
     if order.illegal:
       raise newException(CogiavelliError,
         "illegal order '" & raw & "': " & order.why)
+    if entry.getStr() notin legalOrders(sim.board, order.unit):
+      raise newException(CogiavelliError, "copy the listed order for " & unitText(sim.board.unitAt(order.unit)))
     if claimed[order.unit]:
       raise newException(CogiavelliError,
         "duplicate order for unit at " & Provinces[order.unit].code)
     claimed[order.unit] = true
-    result.orders.add(formatOrder(sim.board, order))
+    result.orders.add(raw)
   for unit in sim.myUnits(power):
     if not claimed[unit.province]:
       raise newException(CogiavelliError,
@@ -1074,47 +1046,39 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string):
-    string =
+proc nativePayload(response: Response, error, url: string): JsonNode =
   if error.len > 0:
     raise newException(CogiavelliError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(CogiavelliError,
-        "bedrock model access denied: " & detail)
     raise newException(CogiavelliError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(CogiavelliError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(CogiavelliError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
-  if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(CogiavelliError, "anthropic refusal")
+  result = parseJson(response.body)
+
+proc textOf(payload: JsonNode): string =
+  if payload{"content"}.isNil or payload{"content"}.kind != JArray:
+    raise newException(CogiavelliError, "missing native content array")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
-  if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(CogiavelliError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
-proc raiseModelFailure(sim: Sim, seat: int, phase: PhaseKind,
-    kind: FailureKind, reason, rawResponse: string) =
-  var err = newException(ModelDecisionError,
+proc modelFailure(sim: Sim, seat: int, phase: PhaseKind,
+    kind: FailureKind, reason, rawResponse: string): ref ModelDecisionError =
+  result = newException(ModelDecisionError,
     "model decision failed for seat " & $seat & " (" &
     PowerNames[sim.powerOf[seat]] & ") in " & $phase & ": " & reason)
-  err.kind = kind
-  err.seat = seat
-  err.power = PowerNames[sim.powerOf[seat]]
-  err.phase = phase
-  err.reason = reason
-  err.rawResponse = rawResponse
-  raise err
+  result.kind = kind
+  result.seat = seat
+  result.power = PowerNames[sim.powerOf[seat]]
+  result.phase = phase
+  result.reason = reason
+  result.rawResponse = rawResponse
 
 proc decideAll*(
   client: LlmClient,
@@ -1132,91 +1096,70 @@ proc decideAll*(
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   result = newSeq[Decision](seats.len)
-  var open: seq[int]
+  var batch: RequestBatch
+  var modelIndices: seq[int]
+  let started = epochTime()
   for index, seat in seats:
-    let kind = scripted[seat]
-    if kind != skNone:
-      result[index] = scriptedAction(sim, seat, kind, phase)
-    else:
-      if client.transport == ltNone:
-        raiseModelFailure(sim, seat, phase, episodeInconclusive,
-          "no LLM transport configured for non-scripted seat", "")
-      open.add(index)
-  var lastError = newSeq[string](seats.len)
-  var lastKind = newSeq[FailureKind](seats.len)
-  var lastRaw = newSeq[string](seats.len)
-  for attempt in 0 .. 2:
-    if open.len == 0:
-      break
-    let started = epochTime()
-    var batch: RequestBatch
-    var pendingEvidence: seq[DecisionAttempt]
-    for index in open:
-      let seat = seats[index]
-      var user =
-        if phase == phPress: pressPrompt(sim, seat, prompts[seat])
-        else: ordersPrompt(sim, seat, prompts[seat])
-      if attempt > 0:
-        user.add(InvalidHint & " Rejection reason: " & lastError[index] &
-          (if phase == phOrders:
-            ". You MUST copy every order string verbatim from YOUR UNITS AND EVERY LEGAL ORDER above (one order per unit)."
-           else: ""))
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    if scripted[seat] != skNone:
+      result[index] = scriptedAction(sim, seat, scripted[seat], phase)
+      continue
+    if client.transport == ltNone:
+      raise modelFailure(sim, seat, phase, episodeInconclusive,
+        "no LLM transport configured for non-scripted seat", "")
+    let user = if phase == phPress: pressPrompt(sim, seat, prompts[seat])
+               else: ordersPrompt(sim, seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    modelIndices.add(index)
+    batch.post(request.url, request.headers, request.body, $seat)
+    if capture:
+      client.nativeAttempts[seat].add(nativeAttempt(sim.config.players[seat].name,
+        sim.events.len, seat, request.body))
+  if batch.len == 0: return
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let latency = int((epochTime() - started) * 1000.0)
+  var failure: ref ModelDecisionError
+  for position, reply in responses:
+    let index = modelIndices[position]
+    let seat = seats[index]
+    template evidence: untyped = client.nativeAttempts[seat][0]
+    var raw = reply.response.body
+    try:
+      if capture: evidence.receiveNativeResponse(reply.response, latency)
+      let envelope = nativePayload(reply.response, reply.error, batch[position].url)
+      if capture: evidence.recordNativeMetadata(envelope)
+      raw = textOf(envelope)
+      if capture: evidence.response = %raw
+      if envelope{"stop_reason"}.getStr() == "refusal":
+        raise newException(CogiavelliError, "anthropic refusal")
+      if envelope{"stop_reason"}.getStr() == "max_tokens" and '{' notin raw:
+        raise newException(CogiavelliError, "reply cut off at max_tokens before " &
+          "any JSON: " & raw[0 .. min(raw.high, 160)].replace("\n", " "))
+      let payload = extractJsonObject(raw)
+      result[index] = if phase == phPress: parsePress(sim, seat, payload)
+                      else: parseOrdersReply(sim, seat, payload)
       if capture:
-        pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
-          sim.events.len, seat, attempt, request.body))
-      batch.post(request.url, request.headers, request.body, $index)
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    let latency = int((epochTime() - started) * 1000.0)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      var evidence: DecisionAttempt
-      if capture: evidence = pendingEvidence[position]
-      lastRaw[index] = responses[position].response.body
-      try:
-        if capture:
-          evidence.receiveNativeResponse(responses[position].response,
-            responses[position].error, latency)
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        lastRaw[index] = text
-        let payload = extractJsonObject(text)
-        result[index] =
-          if phase == phPress: parsePress(sim, seat, payload)
-          else: parseOrdersReply(sim, seat, payload)
-        if capture:
-          evidence.parsedAction = result[index].decisionReply(phase)
-          # Fill only schema-optional omissions in this comparison. Keep the
-          # original response and request unchanged; repairs still fail equality.
-          var candidate = copy(payload)
-          let defaults = if phase == phPress:
-            %*{"broadcast": "", "letters": [], "pledges": [], "notes": ""}
-            else: %*{"spend": [], "builds": [], "notes": ""}
-          for key, value in defaults:
-            if not candidate.hasKey(key): candidate[key] = value
-          if phase == phPress and candidate["pledges"].kind == JArray:
-            for pledge in candidate["pledges"]:
-              if pledge.kind == JObject:
-                if not pledge.hasKey("province"): pledge["province"] = %""
-                if not pledge.hasKey("to"): pledge["to"] = %""
-          evidence.accepted = candidate == evidence.parsedAction
-          if not evidence.accepted:
-            evidence.rejectionReason = some("native parser normalized the proposal")
-      except CatchableError as error:
-        if capture: evidence.rejectionReason = some(error.msg)
-        let reply = responses[position]
-        lastKind[index] = if reply.error.len > 0 or reply.response.code notin 200..299:
+        evidence.parsedAction = result[index].decisionReply(phase)
+        # Fill only schema-optional omissions in this comparison. Keep the
+        # original response and request unchanged; repairs still fail equality.
+        var candidate = copy(payload)
+        let defaults = if phase == phPress:
+          %*{"broadcast": "", "letters": [], "pledges": [], "notes": ""}
+          else: %*{"spend": [], "builds": [], "notes": ""}
+        for key, value in defaults:
+          if not candidate.hasKey(key): candidate[key] = value
+        if phase == phPress and candidate["pledges"].kind == JArray:
+          for pledge in candidate["pledges"]:
+            if pledge.kind == JObject:
+              if not pledge.hasKey("province"): pledge["province"] = %""
+              if not pledge.hasKey("to"): pledge["to"] = %""
+        evidence.accepted = candidate == evidence.parsedAction
+        if not evidence.accepted:
+          evidence.rejectionReason = some("native parser normalized the proposal")
+    except CatchableError as error:
+      if capture: evidence.rejectionReason = some(error.msg)
+      if failure.isNil:
+        let kind = if reply.error.len > 0 or reply.response.code notin 200..299:
           episodeInconclusive
         else: playerError
-        lastError[index] = error.msg
-        echo "cogiavelli llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        stillOpen.add(index)
-      if capture: client.nativeAttempts[seat].add(evidence)
-    open = stillOpen
-  if open.len > 0:
-    let failedIndex = open[0]
-    let failedSeat = seats[failedIndex]
-    raiseModelFailure(sim, failedSeat, phase, lastKind[failedIndex],
-      lastError[failedIndex], lastRaw[failedIndex])
+        failure = modelFailure(sim, seat, phase, kind, error.msg, raw)
+  if not failure.isNil: raise failure

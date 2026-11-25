@@ -15,8 +15,6 @@ type
     units*: seq[Unit]
     at*: array[NumAreas, int]   ## unit index standing in each area, -1 empty
 
-const MaxLegalOrders* = 64
-
 proc newBoard*(units: seq[Unit]): Board =
   result.units = units
   for index in 0 ..< NumAreas:
@@ -276,43 +274,31 @@ proc checkLegality*(board: Board, order: var Order) =
       order.why = "nonadjacent"
 
 proc legalOrders*(board: Board, province: int): seq[string] =
-  ## Every order the unit in `province` may legally issue, in the exact
-  ## notation a reply must use. Capped at `MaxLegalOrders`.
-  let index = board.unitIndexAt(province)
-  if index < 0:
+  ## Enumerate the canonical choices using the same rule check as dispatch.
+  ## Support and convoy can be submitted even if the other unit won't match.
+  if not board.hasUnit(province):
     return
-  let unit = board.units[index]
+  let unit = board.unitAt(province)
+  template offer(action: OrderKind, dest = -1, source = -1, into = -1, convoy = false) =
+    var order = Order(power: unit.power, unit: province, kind: action,
+      target: dest, auxFrom: source, auxTo: into, viaConvoy: convoy)
+    checkLegality(board, order)
+    if not order.illegal:
+      result.add(formatOrder(board, order))
+
+  offer(okHold)
   let fleet = unit.kind == ukFleet
-  let head = kindLetter(unit.kind) & " " & Provinces[province].code
-  result.add(head & " H")
   let neighbours = if fleet: FleetAdj[province] else: ArmyAdj[province]
   for dest in neighbours:
-    result.add(head & " - " & Provinces[dest].code)
+    offer(okMove, dest)
   if not fleet and isCoastal(province):
     for dest in convoyReachable(province):
-      if dest notin neighbours:
-        result.add(head & " - " & Provinces[dest].code & " VIA CONVOY")
-  for other in neighbours:
-    if not board.hasUnit(other):
-      continue
-    let friend = board.unitAt(other)
-    result.add(head & " S " & kindLetter(friend.kind) & " " &
-      Provinces[other].code)
-    let friendAdj =
-      if friend.kind == ukFleet: FleetAdj[other] else: ArmyAdj[other]
-    for dest in friendAdj:
-      if dest != province and dest in neighbours:
-        result.add(head & " S " & kindLetter(friend.kind) & " " &
-          Provinces[other].code & " - " & Provinces[dest].code)
-  if fleet and isSea(province):
-    for other in FleetAdj[province]:
-      if not isCoastal(other) or not board.hasUnit(other):
-        continue
-      if board.unitAt(other).kind == ukFleet:
-        continue
-      for dest in convoyReachable(other):
-        if dest != other:
-          result.add(head & " C A " & Provinces[other].code & " - " &
-            Provinces[dest].code)
-  if result.len > MaxLegalOrders:
-    result.setLen(MaxLegalOrders)
+      offer(okMove, dest, convoy = true)
+
+  for other in board.units:
+    offer(okSupportHold, source = other.province)
+    for dest in neighbours:
+      offer(okSupportMove, source = other.province, into = dest)
+    if fleet and isSea(province) and other.kind == ukArmy and isCoastal(other.province):
+      for dest in 0 ..< NumLand:
+        offer(okConvoy, source = other.province, into = dest)

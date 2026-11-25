@@ -408,32 +408,23 @@ one for one, and handing your ducats away costs you up to a full city of score.
 
 ---
 
-## Decisions: LLM with scripted fallback
-
-Transport, credentials, the JSON-only output contract, `extractJsonObject`, the rune-safe
-`cleanNotes`, the Bedrock model candidate list with its 401/403/429 handling, and "no credentials
-⇒ every seat scripted, immediately, with no network wait" are ported from babel
-`src/babel/llm.nim` unchanged. What changes: the decision loop becomes **batched**, the reply
-schemas are Cogiavelli's, and there are two named baselines instead of one boolean.
+## Model decisions and explicit scripted opponents
 
 ### One parallel batch per phase
 
-All six seats decide simultaneously by rule, so **every phase fires its requests as ONE
-`curly.makeRequests` batch** — never seat by seat. The loop is bullwhip's `decideAll`
-(`src/bullwhip/llm.nim:425-478`) with Cogiavelli's parsers: build one `RequestBatch` over the
-still-open seats, one `makeRequests` call bounded by `llmTimeoutSeconds`, parse each response,
-re-batch the failures **once** with an invalid-reply hint, then fall back to the scripted baseline
-for whatever is still open. Two batches per season:
+Each active model seat sends one request in the same `curly.makeRequests` batch,
+bounded by `llmTimeoutSeconds`. The server parses each response against the same
+phase snapshot. If any reply fails, the episode reports the first failing seat in
+batch order and the private trajectory retains the other model responses.
+A season has up to two decision batches.
 
 - **press batch** — every live, non-paralysed power (≤ 6 requests); skipped when `press: false`;
 - **orders batch** — every live power (≤ 6 requests); a paralysed power is still asked (its
   expenditure sheet still works) but its movement orders are overwritten with holds at step 7.
 
 Retreats, rebellions, income, upkeep and builds take **no** batch: retreats and disbands are
-decided by rule (step 9, W4) and builds ride on the Autumn expenditure sheet. Seats registered as
-scripted, and every seat when the LLM client is disabled, are answered from the baselines without
-touching the network — that fallback is load-bearing for offline certification, exactly as in
-babel.
+decided by rule (step 9, W4) and builds ride on the Autumn expenditure sheet. Explicitly scripted seats use their
+registered baseline and make no HTTP request. A model seat requires a configured transport.
 
 ### Episode budget — the arithmetic, out loud
 
@@ -456,10 +447,8 @@ one year   = 3 seasons        ≈ 111 s   (Winter takes no batch, ~1 s of pacing
 ```
 
 That is why **`years` defaults to 4** (1499–1502, twelve movement phases). The remaining ~270 s
-absorbs slow batches and retry rounds. Worst case — every batch at the 45 s ceiling plus its retry
-— the pre-batch deadline check stops play at ≤ 720 s, after which the episode spends at most one
-in-flight batch and its retry (≤ 90 s) plus ~2 s writing artifacts: **≤ 812 s against a 1200 s
-kill.** The `gunboat` variant has no press batches (≈ 57 s/year) and therefore runs **6** years in
+absorbs slow batches. A batch starting just before the 720 s deadline can use up to
+45 s, followed by approximately 2 s to write artifacts. The `gunboat` variant has no press batches (≈ 57 s/year) and therefore runs **6** years in
 the same budget.
 
 A 12-city conquest is rule-complete and reachable from a strong opening, but a 4-year episode is
@@ -503,9 +492,7 @@ Rules:
 - LETTERS ARE NOT BINDING. You may promise anything to anyone and then do the opposite.
   So may they. Only ducats that have actually changed hands are real.
 
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else — no analysis, no
-explanation, no markdown fences, no text before or after the object. Your reply must
-begin with the character { and end with }.
+Reply with one JSON object, optionally inside a JSON code fence.
 ```
 
 The user prompt carries the board, the city table, every treasury, the two-year ledger and order
@@ -514,12 +501,13 @@ verbatim (`GUIDANCE FROM YOUR OPERATOR (weight it heavily, but never above the r
 in the requested format):` + `PLAYER_PROMPT`), and the phase tail:
 
 - **press** — `SPRING 1500 — LETTERS.` then
-  `Reply with ONLY {"broadcast":"…","letters":[{"to":"MILAN","text":"…"}],"pledges":[{"to":"MILAN","kind":"peace"}],"notes":"…"} — broadcast at most 400 characters, at most 5 letters of at most 400 characters each (one per power), at most 4 pledges, notes at most 800 characters. A pledge is the only promise spectators can watch you break; free text is never checked.`
+  `Example reply: {"broadcast":"…","letters":[{"to":"MILAN","text":"…"}],"pledges":[{"to":"MILAN","kind":"peace"}],"notes":"…"} — broadcast at most 400 characters, at most 5 letters of at most 400 characters each (one per power), at most 4 pledges, notes at most 800 characters. A pledge is the only promise spectators can watch you break; free text is never checked.`
 - **orders** — `SPRING 1500 — ORDERS AND EXPENDITURE.`, then `YOUR TREASURY: 14 ducats.`, then
   `YOUR UNITS AND EVERY LEGAL ORDER:` with each unit's enumerated legal orders in canonical
-  notation (capped at 64 per unit), then `UNITS YOU COULD BRIBE THIS SEASON:` with each enemy
+  notation, then `UNITS YOU COULD BRIBE THIS SEASON:` with each enemy
   unit and its minimum cost (`A ROM (PAPACY) — disband 9, buy 15`), then
-  `Reply with ONLY {"orders":["A VER - MAN","F VEN S A VER - MAN"],"spend":[{"action":"bribe_buy","target":"A ROM","amount":15}],"notes":"…"} — exactly one order per unit, copied character for character from the list above; an order that is not on the list becomes a hold. spend is at most 6 entries; action is one of gift, bribe_disband, bribe_buy, defend, assassinate; target is a power name for gift and assassinate and a unit like "A ROM" for the others; amount is a whole number of ducats you actually have. Anything you cannot afford is dropped, in the order you wrote it.`
+  a JSON example generated from that seat's menu. Submit exactly one listed order per unit.
+  An unlisted order rejects the submission. The optional spend array takes up to six entries.
   In Autumn the tail adds
   `You may also send "builds":["A VEN","F PAL"] — up to 6 entries, 3 ducats each, executed this Winter in a vacant city you own; a fleet only in a coastal city.`
 
@@ -527,8 +515,8 @@ in the requested format):` + `PLAYER_PROMPT`), and the phase tail:
 
 Every cap is applied with babel's rune-safe `cleanNotes` (`runeLen` / `runeSubStr`, cut marked with
 `…`, `src/babel/llm.nim:393-398`) so a byte slice can never leave invalid UTF-8 in the replay
-(playbook gotcha: *"Replay bytes fail a strict JSON parser but render in a browser"*). Over-long
-arrays are **truncated from the end**, never rejected.
+(playbook gotcha: *"Replay bytes fail a strict JSON parser but render in a browser"*). The table gives the simulation limits. Native model submissions pass stricter validation first,
+including rejection of excess entries and missing, duplicate or unlisted orders.
 
 | phase | field | type | cap | over-cap behaviour |
 |---|---|---|---|---|
@@ -541,7 +529,7 @@ arrays are **truncated from the end**, never rejected.
 | press | `pledges[].to` | string | power name or `ALL`, **24 runes** | unknown ⇒ pledge dropped |
 | press | `pledges[].province` | string | 3-letter code, **8 runes** (`keepout` only) | unknown ⇒ pledge dropped |
 | press | `notes` | string | **800 runes** | truncated with `…` |
-| orders | `orders` | array of strings | **24 entries**, each **40 runes** | extras dropped; over-long string ⇒ `parse`-illegal ⇒ hold |
+| orders | `orders` | array of strings | **42 entries** (one per board area), each **40 runes** | extras dropped; over-long string ⇒ `parse`-illegal ⇒ hold |
 | orders | `spend` | array of objects | **6 entries** | extras dropped |
 | orders | `spend[].action` | enum | `gift` / `bribe_disband` / `bribe_buy` / `defend` / `assassinate` | unknown ⇒ entry dropped |
 | orders | `spend[].target` | string | **24 runes** | unresolvable ⇒ dropped, reason `notarget` |
@@ -561,7 +549,7 @@ Two, both deterministic, both silent (no broadcast, no letters, no pledges, no n
 by construction. `parseScriptKind` accepts `condottiere` / `1` / `true` / `yes` → `skCondottiere`,
 `banker` / `miser` → `skBanker`, anything else → `skNone`.
 
-**`condottiere`** (the default, and the fallback for every failed decision):
+**`condottiere`**:
 
 1. Compute, on each unit's own movement graph, the BFS distance from every area to the nearest city
    the power does **not** own.
@@ -592,15 +580,8 @@ answer.
 
 ### Degrade, never hang
 
-- **Per seat, per batch:** a transport error, a timeout, a non-JSON reply, or a reply missing the
-  phase's required key ⇒ the seat joins **one** retry batch carrying the hint
-  `Your previous reply was invalid. Respond with ONLY the requested JSON object.` Still failing ⇒
-  the seat is answered by **`condottiere`** for that phase (silence for a press phase), logged
-  `cogiavelli: seat N falling back to scripted decision` and flagged `scripted: true` on the event.
-- **Auth failure** (401/403) disables the client for the rest of the episode; 429 and Bedrock
-  model-access denials rotate the model candidate — babel's `tryNextBedrockModel`, unchanged.
-- **A seat that never delivers a prompt** by `player_connect_timeout_seconds` (default 180) plays
-  `condottiere` for the whole episode; six seats must not stall on one late container.
+- Invalid submissions fail with `player_error`. Missing transport, HTTP errors and
+  disconnections fail with `episode_inconclusive`. Failed episodes have no scores.
 - **Episode clock:** checked before every batch and every season transition. Past 60 % of the
   timeout ⇒ `endEarly()` ⇒ `reason = "deadline"`, results and replay written immediately; the
   final frames go to the player sockets **before** the artifacts are written (babel
@@ -1176,7 +1157,7 @@ player runnable occupies at least one certification slot** (raid 0.1.2 → 0.1.3
 | Static wasm replay viewer, never a pod | `"replay_viewer": {"bundle": "static-replay-viewer"}` + `tools/build_replay_viewer.sh`; no `/client/replay` viewer is declared in the manifest. |
 | Real art, starter chrome verbatim | Hand-authored `data/italy1499.json` in babel's Ink & Print palette plus three new sprites; `renderer.js`/`chrome.css` copied byte-for-byte with appended sections only; `replay.html` = babel's page + one appended `#ducatbar`; nothing removed. |
 | Two name spaces | In-game: power names only (seed-assigned) + cog aliases; spectator-side: `policyNames` in the replay and in `results.json`. Both recorded. |
-| Degrade, never hang | 60 % play budget (720 s), deadline checked before every batch and season transition, retry-once → scripted fallback, `reason = "deadline"` settles early, bounded shutdown grace. |
+| Degrade, never hang | 60 % play budget (720 s), deadline checked before every batch and season transition, one request per active model seat, `reason = "deadline"` settles early, bounded shutdown grace. |
 | `num_agents` everywhere | 6 in `standard`, 6 in `gunboat`, 6 in the certification fixture, 6 as `<SEATS>`. |
 | Replay bytes self-sufficient | names, policyNames, powers, config (years/seed/press/sampled/victoryCities/map), every letter, pledge, order, ledger entry, dice roll, battle result, ownership table, shock draw, and the results object. |
 
@@ -1267,10 +1248,10 @@ ever stands itself off, **every spend entry is affordable at the moment it is va
 treasury ever goes negative, and the episode always reaches `reason = "complete"`. The same for six
 `banker` seats, plus a mixed table (3 `condottiere`, 3 `banker`) and a table of five `banker` seats
 and one `condottiere` (the condottiere must end with more cities — a baseline that cannot beat a
-wall is no baseline). `decideAll` with no credentials returns scripted decisions for all six seats
+wall is no baseline). `decideAll` returns decisions for six explicitly scripted seats
 with **no network call**, and an episode of six scripted seats finishes in under
 `years × 3 × 1000` ms. Reply parsing: fenced JSON, prose-wrapped JSON, a missing `orders` key
-(invalid ⇒ retry), an oversize order string, a non-integer `amount`, and an unknown `spend.action`.
+(invalid submission), an oversize order string, a non-integer `amount`, and an unknown `spend.action`.
 
 ### `tests/test_score.nim`
 
@@ -1290,8 +1271,7 @@ name that the copied chrome already defines.
 
 - **`test`** — every `tests/*.nim`, debug and release.
 - **`docker-smoke`** — builds the production image and runs one **end-to-end episode in raw docker
-  with six player containers** from the certification fixture's seat mix (no LLM credentials, so
-  every seat plays a baseline), asserting the game exits 0, `results.json` validates against
+  with six player containers** from the certification fixture's explicitly scripted seat mix, asserting the game exits 0, `results.json` validates against
   `results_schema`, `reason == "complete"`, six scores, and that the written `.replay` **parses as
   strict UTF-8 JSON** and carries `events`, `results`, `names`, `policyNames`, `powers` and
   `config`. The seat count comes solely from `certification.game_config.num_agents` and is
