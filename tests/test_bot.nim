@@ -186,7 +186,7 @@ block explicitScriptedNeedsNoNetworkAndModelFailsWithoutTransport:
     discard decideAll(client, PromptSelection(), sim, sim.phase, sim.pendingSeats(),
       newSeq[string](6), modelKinds)
   except ModelDecisionError as error:
-    failed = error.seat == 0
+    failed = error.seat == 0 and error.kind == episodeInconclusive
   check(failed, "an unscripted model seat with no transport raises ModelDecisionError")
 
 block finishesFast:
