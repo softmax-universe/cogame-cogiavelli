@@ -163,11 +163,13 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
             assert rc != 0, f"expected non-zero exit for {name}, got 0"
             assert not (root / "results.json").exists(), f"failed episode must not write fake results.json in {name}"
             failure = json.loads((root / "player_failure.json").read_text())
-            assert failure["seat"] == 0 and failure["reason"]
+            assert set(failure.keys()) == {"failed_policy_index", "kind", "message"}, failure
+            assert failure["failed_policy_index"] == 0 and failure["kind"] == "player_error"
+            assert failure["message"]
             if provider_mode == "always_invalid":
-                assert "RAW_INVALID_MODEL_OUTPUT_12345" in failure["raw_response"]
+                assert "RAW_INVALID_MODEL_OUTPUT_12345" in failure["message"]
             elif provider_mode == "illegal_order":
-                assert "A NOT_A_PROVINCE - NOPE" in failure["raw_response"]
+                assert "A NOT_A_PROVINCE - NOPE" in failure["message"]
             if capture:
                 rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"

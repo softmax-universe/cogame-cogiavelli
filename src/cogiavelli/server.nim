@@ -228,16 +228,13 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, power, phase,
       if seat >= 0 and seat < state.config.players.len:
         state.config.players[seat].name
       else: ""
+    let detail = "seat " & $seat & " (" & power & ", " & $state.sim.season &
+      " " & $state.sim.year & " " & phase & "): " & reason &
+      (if rawResponse.len > 0: " | raw_response=" & rawResponse else: "")
     failureJson = %*{
-      "seat": seat,
-      "slot": seat,
-      "power": power,
-      "policy": policyName,
-      "phase": phase,
-      "year": state.sim.year,
-      "season": $state.sim.season,
-      "reason": reason,
-      "raw_response": rawResponse
+      "failed_policy_index": max(seat, 0),
+      "kind": "player_error",
+      "message": cleanText(detail, 1900)
     }
     if not state.trajectory.isNil and seat >= 0:
       let obs = if observation.isNil: state.sim.observationJson(seat) else: observation

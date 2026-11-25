@@ -1138,7 +1138,7 @@ proc decideAll*(
       open.add(index)
   var lastError = newSeq[string](seats.len)
   var lastRaw = newSeq[string](seats.len)
-  for attempt in 0 .. 1:
+  for attempt in 0 .. 2:
     if open.len == 0:
       break
     let started = epochTime()
@@ -1150,7 +1150,10 @@ proc decideAll*(
         if phase == phPress: pressPrompt(sim, seat, prompts[seat])
         else: ordersPrompt(sim, seat, prompts[seat])
       if attempt > 0:
-        user.add(InvalidHint & " Error: " & lastError[index])
+        user.add(InvalidHint & " Rejection reason: " & lastError[index] &
+          (if phase == phOrders:
+            ". You MUST copy every order string verbatim from YOUR UNITS AND EVERY LEGAL ORDER above (one order per unit)."
+           else: ""))
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       if capture:
         pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
