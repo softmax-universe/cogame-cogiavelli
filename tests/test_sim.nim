@@ -32,7 +32,7 @@ proc scriptedAll(): seq[ScriptKind] =
 
 proc playOut(config: GameConfig): Sim =
   var sim = initSim(config)
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   let kinds = scriptedAll()
   var guard = 0
@@ -56,7 +56,7 @@ proc playOut(config: GameConfig): Sim =
 
 block seasonSequencing:
   var sim = initSim(newConfig(press = true, years = 1))
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   let kinds = scriptedAll()
   var order: seq[string]
@@ -123,7 +123,7 @@ block conquestAtTwelve:
     else:
       sim.owner[slot] = -1
   sim.board = newBoard(units)
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   let kinds = scriptedAll()
   let seats = sim.pendingSeats()
@@ -148,7 +148,7 @@ block lastPowerStanding:
   sim.owner[CityIndex[VEN]] = power
   units.add(Unit(power: power, kind: ukArmy, province: VEN))
   sim.board = newBoard(units)
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   let kinds = scriptedAll()
   let seats = sim.pendingSeats()

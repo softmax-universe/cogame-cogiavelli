@@ -87,12 +87,22 @@ for game, maximum in (("standard", 144), ("gunboat", 108)):
                                 "text": f"SECRET-{power}",
                             }
                         ]
-                        action["letters"].append(
+                        bad_action = dict(action)
+                        bad_action["letters"] = action["letters"] + [
                             {
                                 "to": action["letters"][0]["to"],
                                 "text": f"DROPPED-SECRET-{power}",
                             }
+                        ]
+                        rejected = request(
+                            process,
+                            {
+                                "kind": "step",
+                                "decision_id": obs["decision_id"],
+                                "response": json.dumps(bad_action),
+                            },
                         )
+                        assert rejected["kind"] == "rejected"
                     response = request(
                         process,
                         {
@@ -104,7 +114,7 @@ for game, maximum in (("standard", 144), ("gunboat", 108)):
                     assert response["kind"] == "accepted"
                     assert response["action"]["notes"] == action["notes"]
                     if view["phase"] == "press":
-                        assert response["action"]["letters"] == action["letters"][:1]
+                        assert response["action"]["letters"] == action["letters"]
                     trace.append((view, user, response["action"]))
                     assert len(trace) <= maximum
                     obs = response["observation"]

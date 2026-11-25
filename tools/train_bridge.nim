@@ -108,23 +108,29 @@ proc encode(): JsonNode =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = if languageMode: extractJsonObject(command["response"].getStr())
-    else: parseJson(command["response"].getStr())
   let seat = seats[index]
-  let decision = if languageMode:
-    if snapshot.phase == phPress: parsePress(snapshot, seat, action)
-    else: parseOrdersReply(snapshot, seat, action)
-  else:
-    let choice = action["choice"].getInt()
-    doAssert choice in 0 .. 1
-    scriptedAction(snapshot, seat, if choice == 0: skCondottiere else: skBanker, snapshot.phase)
+  var action: JsonNode
+  var decision: Decision
+  try:
+    action = if languageMode: extractJsonObject(command["response"].getStr())
+      else: parseJson(command["response"].getStr())
+    decision = if languageMode:
+      if snapshot.phase == phPress: parsePress(snapshot, seat, action)
+      else: parseOrdersReply(snapshot, seat, action)
+    else:
+      let choice = action["choice"].getInt()
+      if choice notin 0 .. 1:
+        raise newException(CogiavelliError, "choice must be 0 or 1")
+      scriptedAction(snapshot, seat, if choice == 0: skCondottiere else: skBanker, snapshot.phase)
+  except CatchableError as error:
+    return %*{"kind": "rejected", "reason": error.msg}
   let eventIndex = game.events.len
   if snapshot.phase == phPress:
     game.applyPress(seat, decision.broadcast, decision.letters,
-      decision.pledges, decision.notes, true)
+      decision.pledges, decision.notes, not languageMode)
   else:
     game.applyOrders(seat, decision.orders, decision.spend,
-      decision.builds, decision.notes, true)
+      decision.builds, decision.notes, not languageMode)
   let accepted = if languageMode: executedReply(game.events[eventIndex]) else: action
   inc decisionId
   inc index

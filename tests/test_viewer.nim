@@ -26,7 +26,7 @@ proc newConfig(): GameConfig =
 
 proc playOut(config: GameConfig): Sim =
   var sim = initSim(config)
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   var kinds: seq[ScriptKind]
   for index in 0 ..< 6:

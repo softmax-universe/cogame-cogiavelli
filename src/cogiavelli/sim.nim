@@ -109,17 +109,8 @@ proc powerIndex*(name: string): int =
   let key = name.strip().toUpperAscii()
   if key.len == 0:
     return -1
-  if key == "ALL" or key == "EVERYONE":
-    return -1
   for index, power in PowerNames:
     if key == power:
-      return index
-  ## "THE PAPACY", "THE TURK", adjectives.
-  for index, power in PowerAdjectives:
-    if key == power.toUpperAscii():
-      return index
-  for index, power in PowerNames:
-    if key == "THE " & power:
       return index
   -1
 

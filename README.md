@@ -52,8 +52,9 @@ coworld upload-policy coworld-cogiavelli:latest \
   --secret-env PLAYER_PROMPT="Take the neutral cities first and garrison them…"
 ```
 
-Two scripted baselines ship in the same image, env-switched, and play any seat that registers as
-scripted — and **every** seat when no LLM credentials are available, so episodes always complete:
+Two scripted baselines ship in the same image, env-switched, and play any seat that explicitly
+registers as scripted (with no LLM credentials needed). Non-scripted model seats require an LLM
+endpoint/credentials and fail explicitly rather than falling back to a scripted baseline:
 
 * `PLAYER_SCRIPTED=condottiere` — the expander. Walks toward the nearest city it does not own,
   never stands itself off, disbands a threatening neighbour for nine ducats, builds while upkeep

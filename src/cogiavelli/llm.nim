@@ -2,24 +2,21 @@
 ## just a prompt: the game server composes that seat's view — the board,
 ## the city table, every treasury, the ledger, the press it received, the
 ## complete legal order set for each of its units and the exact price of
-## every bribable enemy unit — plus the seat's prompt, and asks Claude what
-## it writes, orders and spends.
+## every bribable enemy unit — plus the seat's prompt, and asks the model
+## what it writes, orders and spends.
 ##
 ## All six powers decide simultaneously by rule, so EVERY phase fires its
-## requests as ONE `curly.makeRequests` batch — never seat by seat. The
-## loop is bullwhip's `decideAll`: build one batch over the still-open
-## seats, parse each reply, re-batch the failures once with an
-## invalid-reply hint, then fall back to the scripted baseline for whatever
-## is still open.
+## requests as ONE `curly.makeRequests` batch — never seat by seat.
+## Explicitly scripted seats (`PLAYER_SCRIPTED=condottiere|banker`) run
+## deterministically without an LLM. Model seats (`skNone`) require a
+## configured LLM transport; invalid or failed model replies are retried
+## once and then fail the episode explicitly with no scripted fallback.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing.
 
 import
   std/[algorithm, json, options, os, strutils, times, unicode],
@@ -65,12 +62,19 @@ type
     defendAmount*: int         ## banker: ducats per defend entry
     buildTreasury*: int        ## banker: build only from here up
 
-  LlmTransport = enum
+  ModelDecisionError* = object of CogiavelliError
+    seat*: int
+    power*: string
+    phase*: PhaseKind
+    reason*: string
+    rawResponse*: string
+
+  LlmTransport* = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
   LlmClient* = ref object
     curl: Curly
-    transport: LlmTransport
+    transport*: LlmTransport
     apiKey: string
     sidecarEndpoint: string
     bedrockEndpoint: string
@@ -80,7 +84,6 @@ type
     model: string
     maxOutputTokens: int
     timeoutSeconds: int
-    disabled*: bool
     nativeAttempts*: seq[seq[DecisionAttempt]]
 
 ## FITTED, not chosen: every value below is the argmax of the grid in
@@ -101,12 +104,17 @@ const ShippedBaseline* = BaselineParams(
 )
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"condottiere" play the
-  ## expander, "banker"/"miser" the hoarder, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "condottiere": skCondottiere
-  of "banker", "miser": skBanker
-  else: skNone
+  ## Canonical PLAYER_SCRIPTED values: "" for an LLM seat, "condottiere" for
+  ## the expander baseline, "banker" for the hoarder baseline.
+  let cleaned = text.strip().toLowerAscii()
+  case cleaned
+  of "": skNone
+  of "condottiere": skCondottiere
+  of "banker": skBanker
+  else:
+    raise newException(CogiavelliError,
+      "unknown PLAYER_SCRIPTED baseline '" & text &
+      "' (expected condottiere, banker, or empty)")
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -183,8 +191,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
     echo "cogiavelli llm: anthropic transport, model ", result.model
   else:
     result.transport = ltNone
-    result.disabled = true
-    echo "cogiavelli llm: no LLM credentials; using scripted fallback"
+    echo "cogiavelli llm: no LLM credentials configured (only explicit scripted seats can play)"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -325,7 +332,8 @@ proc condottiereOrders*(sim: Sim, power: int,
     let head = kindLetter(sim.board.units[index].kind) & " " &
       Provinces[plan.unit].code
     if plan.supportUnit >= 0:
-      result.add(head & " S " & Provinces[plan.supportUnit].code & " - " &
+      let supported = sim.board.unitAt(plan.supportUnit)
+      result.add(head & " S " & unitText(supported) & " - " &
         Provinces[plan.supportDest].code)
     elif plan.dest >= 0:
       result.add(head & " - " & Provinces[plan.dest].code)
@@ -429,7 +437,7 @@ proc bankerOrders(sim: Sim, power: int): seq[string] =
       options.add(dest)
     options.sortByCode()
     if options.len > 0:
-      result.add(head & " S " & Provinces[options[0]].code)
+      result.add(head & " S " & unitText(sim.board.unitAt(options[0])))
     else:
       result.add(head & " H")
 
@@ -648,7 +656,7 @@ proc otherPowersText(power: int): string =
   var parts: seq[string]
   for index in 0 ..< Powers:
     if index != power:
-      parts.add(PowerPromptNames[index])
+      parts.add(PowerNames[index])
   if parts.len < 2:
     return parts.join("")
   parts[0 ..< parts.len - 1].join(", ") & " and " & parts[^1]
@@ -716,6 +724,13 @@ proc pressPrompt*(sim: Sim, seat: int, prompt: string): string =
 proc ordersPrompt*(sim: Sim, seat: int, prompt: string): string =
   let power = sim.powerOf[seat]
   let buildsField = if sim.season == seAutumn: ",\"builds\":[]" else: ""
+  var exampleOrders = newJArray()
+  for unit in sim.myUnits(power):
+    let options = legalOrders(sim.board, unit.province)
+    if options.len > 0:
+      let pick = if exampleOrders.len == 0 and options.len > 1: options[1]
+                 else: options[0]
+      exampleOrders.add(%pick)
   result.add(seasonName(sim.season) & " " & $sim.year &
     " \u2014 ORDERS AND EXPENDITURE.\n\n")
   result.add(sim.commonBlock(power))
@@ -728,195 +743,266 @@ proc ordersPrompt*(sim: Sim, seat: int, prompt: string): string =
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
   result.add("Reply with ONLY one JSON object:\n" &
-    "{\"orders\":[\"A VER - MAN\",\"F VEN S A VER - MAN\"],\"spend\":[]" &
+    "{\"orders\":" & $exampleOrders & ",\"spend\":[]" &
     buildsField & ",\"notes\":\"\u2026\"}\n" &
-    "- orders: one string per unit, copied verbatim from YOUR UNITS above " &
-    "(unlisted orders become holds).\n" &
-    "- spend: <= " & $MaxSpendEntries & " entries of " &
+    "- orders: one string per unit you own, copied verbatim from YOUR UNITS above " &
+    "([] only if you have no units).\n" &
+    "- spend: optional (default []), <= " & $MaxSpendEntries & " entries of " &
     "{\"action\":\"gift|bribe_disband|bribe_buy|defend|assassinate\"," &
     "\"target\":\"<POWER or unit like A ROM>\",\"amount\":<int>} " &
-    "(target is a power name for gift/assassinate, a unit for bribe_*/defend; " &
-    "unaffordable entries are dropped in order).\n" &
+    "(target is an exact power name VENICE|MILAN|FLORENCE|PAPACY|NAPLES|TURK for gift/assassinate, " &
+    "an enemy unit for bribe_*, or your own unit for defend; assassinate amount is " &
+    $AssassinMin & ".." & $AssassinMax & ").\n" &
     (if sim.season == seAutumn:
-      "- builds: <= " & $MaxBuilds & " entries like \"A VEN\" or \"F PAL\" (" &
+      "- builds: optional (default []), <= " & $MaxBuilds & " entries like \"A VEN\" or \"F PAL\" (" &
       $BuildCost & " ducats each this Winter in vacant owned cities; fleets coastal only).\n"
      else: "") &
-    "- notes: private memory for next phase (<= " & $MaxNotesLen & " chars).")
+    "- notes: optional private memory for next phase (<= " & $MaxNotesLen & " chars).")
 
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response, tolerating
-  ## a UTF-8 BOM, markdown fences, and trailing prose containing braces.
+  ## Parses a single JSON object from a model response, accepting an optional
+  ## UTF-8 BOM and an optional single outer Markdown JSON fence (` ```json ` or
+  ## ` ``` `). Leading or trailing prose outside the object/fence is rejected.
   var body = strutils.strip(text)
   if body.len >= 3 and body[0 .. 2] == "\xEF\xBB\xBF":
     body = strutils.strip(body[3 .. ^1])
   if body.startsWith("```"):
     let firstBreak = body.find('\n')
-    if firstBreak >= 0:
-      body = body[firstBreak + 1 .. ^1]
-    else:
-      body = body[3 .. ^1]
-    let closing = body.rfind("```")
-    if closing >= 0:
-      body = body[0 ..< closing]
-    body = strutils.strip(body)
-  let start = body.find('{')
-  if start < 0:
-    let head = cleanText(body.replace("\n", " "), 160)
-    raise newException(CogiavelliError, "no JSON object in response: " & head)
-  var depth = 0
-  var inString = false
-  var escaped = false
-  var stop = -1
-  for index in start ..< body.len:
-    let ch = body[index]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{': depth += 1
-    of '}':
-      depth -= 1
-      if depth == 0:
-        stop = index
-    else: discard
-    if stop >= 0:
-      break
-  if stop < 0:
+    if firstBreak < 0:
+      raise newException(CogiavelliError, "malformed markdown fence in response")
+    let fenceHeader = body[3 ..< firstBreak].strip().toLowerAscii()
+    if fenceHeader.len > 0 and fenceHeader != "json":
+      raise newException(CogiavelliError,
+        "unsupported markdown fence language: " & fenceHeader)
+    if not body.endsWith("```"):
+      raise newException(CogiavelliError,
+        "trailing text or unclosed markdown fence in response")
+    body = strutils.strip(body[firstBreak + 1 .. ^4])
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
     let head = cleanText(body.replace("\n", " "), 160)
     raise newException(CogiavelliError,
-      "unbalanced JSON object in response: " & head)
-  parseJson(body[start .. stop])
+      "response must be a single JSON object: " & head)
+  try:
+    result = parseJson(body)
+  except CatchableError as error:
+    let head = cleanText(body.replace("\n", " "), 160)
+    raise newException(CogiavelliError,
+      "invalid JSON object (" & error.msg & "): " & head)
+  if result.kind != JObject:
+    raise newException(CogiavelliError, "JSON response must be an object")
 
 proc parsePress*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## A reply is invalid only when it is not an object or carries neither
-  ## `broadcast` nor `letters`. Illegal contents are repaired, never
-  ## rejected.
+  ## Strict press parser: optional fields (`letters`, `pledges`, `notes`, and
+  ## `broadcast` when `letters` is present) take documented empty defaults,
+  ## while malformed types, illegal targets, duplicate recipients, or excess
+  ## entries are rejected.
   if payload.kind != JObject:
     raise newException(CogiavelliError, "press reply is not a JSON object")
-  let broadcastNode = payload{"broadcast"}
-  let lettersNode = payload{"letters"}
-  if (broadcastNode.isNil or broadcastNode.kind != JString) and
-      (lettersNode.isNil or lettersNode.kind != JArray):
+  let hasBroadcast = payload.hasKey("broadcast")
+  let hasLetters = payload.hasKey("letters")
+  if not hasBroadcast and not hasLetters:
     raise newException(CogiavelliError,
-      "press reply has neither a broadcast string nor a letters array")
-  if not broadcastNode.isNil and broadcastNode.kind == JString:
-    result.broadcast = cleanText(broadcastNode.getStr(), MaxBroadcastLen)
+      "press reply must include broadcast or letters")
+  if hasBroadcast:
+    if payload["broadcast"].kind != JString:
+      raise newException(CogiavelliError, "press broadcast must be a string")
+    result.broadcast = cleanText(payload["broadcast"].getStr(), MaxBroadcastLen)
   let power = sim.powerOf[seat]
-  if not lettersNode.isNil and lettersNode.kind == JArray:
+  if hasLetters:
+    let lettersNode = payload["letters"]
+    if lettersNode.kind != JArray:
+      raise newException(CogiavelliError, "press letters must be an array")
+    if lettersNode.len > MaxLetters:
+      raise newException(CogiavelliError,
+        "too many letters (max " & $MaxLetters & ")")
+    var seenTargets: seq[int]
     for entry in lettersNode:
-      if result.letters.len >= MaxLetters or entry.kind != JObject:
-        continue
-      let target = powerIndex(cleanText(entry{"to"}.getStr(), MaxTargetLen))
+      if entry.kind != JObject:
+        raise newException(CogiavelliError, "each letter must be a JSON object")
+      if not entry.hasKey("to") or entry["to"].kind != JString:
+        raise newException(CogiavelliError, "letter requires string field 'to'")
+      if not entry.hasKey("text") or entry["text"].kind != JString:
+        raise newException(CogiavelliError, "letter requires string field 'text'")
+      let target = powerIndex(cleanText(entry["to"].getStr(), MaxTargetLen))
       if target < 0 or target == power:
-        continue
+        raise newException(CogiavelliError,
+          "invalid letter target: " & entry["to"].getStr())
+      if target in seenTargets:
+        raise newException(CogiavelliError,
+          "duplicate letter target: " & PowerNames[target])
+      seenTargets.add(target)
       result.letters.add(Letter(fromPower: power, toPower: target,
-        text: cleanText(entry{"text"}.getStr(), MaxLetterLen), public: false))
-  let pledgesNode = payload{"pledges"}
-  if not pledgesNode.isNil and pledgesNode.kind == JArray:
+        text: cleanText(entry["text"].getStr(), MaxLetterLen), public: false))
+  if payload.hasKey("pledges"):
+    let pledgesNode = payload["pledges"]
+    if pledgesNode.kind != JArray:
+      raise newException(CogiavelliError, "press pledges must be an array")
+    if pledgesNode.len > MaxPledges:
+      raise newException(CogiavelliError,
+        "too many pledges (max " & $MaxPledges & ")")
     for entry in pledgesNode:
-      if result.pledges.len >= MaxPledges or entry.kind != JObject:
-        continue
+      if entry.kind != JObject:
+        raise newException(CogiavelliError, "each pledge must be a JSON object")
+      if not entry.hasKey("kind") or entry["kind"].kind != JString:
+        raise newException(CogiavelliError, "pledge requires string field 'kind'")
       var kind: PledgeKind
       try:
         kind = parseEnum[PledgeKind](
-          entry{"kind"}.getStr().strip().toLowerAscii())
+          entry["kind"].getStr().strip().toLowerAscii())
       except ValueError:
-        continue
-      let target = powerIndex(cleanText(entry{"to"}.getStr(), MaxTargetLen))
+        raise newException(CogiavelliError,
+          "invalid pledge kind: " & entry["kind"].getStr())
+      var target = -1
+      if entry.hasKey("to"):
+        if entry["to"].kind != JString:
+          raise newException(CogiavelliError, "pledge 'to' must be a string")
+        let toStr = entry["to"].getStr().strip().toUpperAscii()
+        if toStr.len > 0 and toStr != "ALL":
+          target = powerIndex(cleanText(toStr, MaxTargetLen))
+          if target < 0 or target == power:
+            raise newException(CogiavelliError,
+              "invalid pledge target: " & entry["to"].getStr())
       var province = -1
       if kind == plKeepout:
-        province = provinceByCode(cleanText(entry{"province"}.getStr(), 8))
+        if not entry.hasKey("province") or entry["province"].kind != JString:
+          raise newException(CogiavelliError,
+            "keepout pledge requires string field 'province'")
+        province = provinceByCode(cleanText(entry["province"].getStr(), 8))
         if province < 0 or province >= NumLand:
-          continue
-      elif target < 0 or target == power:
-        continue
+          raise newException(CogiavelliError,
+            "invalid keepout province: " & entry["province"].getStr())
+      else:
+        if target < 0 or target == power:
+          raise newException(CogiavelliError,
+            $kind & " pledge requires a valid rival power in 'to'")
       result.pledges.add(Pledge(fromPower: power, toPower: target, kind: kind,
         province: province))
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  if payload.hasKey("notes"):
+    if payload["notes"].kind != JString:
+      raise newException(CogiavelliError, "press notes must be a string")
+    result.notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
 
 proc parseSpendEntry(sim: Sim, power: int, node: JsonNode): SpendEntry =
-  ## Returns an entry with `amount == 0` when the entry must be dropped.
   if node.kind != JObject:
-    return
+    raise newException(CogiavelliError, "each spend entry must be a JSON object")
+  if not node.hasKey("action") or node["action"].kind != JString:
+    raise newException(CogiavelliError, "spend entry requires string field 'action'")
   var kind: SpendKind
   try:
-    kind = parseEnum[SpendKind](node{"action"}.getStr().strip().toLowerAscii())
+    kind = parseEnum[SpendKind](node["action"].getStr().strip().toLowerAscii())
   except ValueError:
-    return
-  let amountNode = node{"amount"}
-  var amount = 0
-  if amountNode.isNil:
-    return
-  case amountNode.kind
-  of JInt:
-    amount = amountNode.getInt()
-  of JFloat:
-    amount = int(amountNode.getFloat())
-  of JString:
-    try:
-      amount = parseInt(amountNode.getStr().strip())
-    except ValueError:
-      return
-  else:
-    return
+    raise newException(CogiavelliError,
+      "unknown spend action: " & node["action"].getStr())
+  if not node.hasKey("amount") or node["amount"].kind != JInt:
+    raise newException(CogiavelliError, "spend entry requires integer field 'amount'")
+  let amount = node["amount"].getInt()
   if amount < 1 or amount > 999:
-    return
-  if kind == spAssassinate:
-    amount = clamp(amount, AssassinMin, AssassinMax)
-  let target = cleanText(node{"target"}.getStr(), MaxTargetLen)
+    raise newException(CogiavelliError, "spend amount out of range: " & $amount)
+  if kind == spAssassinate and (amount < AssassinMin or amount > AssassinMax):
+    raise newException(CogiavelliError,
+      "assassinate amount must be between " & $AssassinMin & " and " & $AssassinMax)
+  if not node.hasKey("target") or node["target"].kind != JString:
+    raise newException(CogiavelliError, "spend entry requires string field 'target'")
+  let target = cleanText(node["target"].getStr(), MaxTargetLen)
   result = SpendEntry(power: power, kind: kind, targetPower: -1,
     targetProvince: -1, amount: amount)
   case kind
   of spGift, spAssassinate:
     result.targetPower = powerIndex(target)
-    if result.targetPower < 0:
-      result.why = "notarget"
-  of spBribeDisband, spBribeBuy, spDefend:
+    if result.targetPower < 0 or result.targetPower == power:
+      raise newException(CogiavelliError,
+        "invalid " & $kind & " target power: " & target)
+  of spBribeDisband, spBribeBuy:
     let province = parseUnitRef(sim.board, target)
-    result.targetProvince = province
     if province < 0:
-      result.why = "notarget"
-    else:
-      result.targetPower = sim.board.unitAt(province).power
-      result.targetUnit = unitText(sim.board.unitAt(province))
+      raise newException(CogiavelliError,
+        "invalid " & $kind & " target unit: " & target)
+    let unit = sim.board.unitAt(province)
+    if unit.power == power:
+      raise newException(CogiavelliError,
+        "cannot bribe own unit: " & target)
+    result.targetProvince = province
+    result.targetPower = unit.power
+    result.targetUnit = unitText(unit)
+  of spDefend:
+    let province = parseUnitRef(sim.board, target)
+    if province < 0:
+      raise newException(CogiavelliError,
+        "invalid defend target unit: " & target)
+    let unit = sim.board.unitAt(province)
+    if unit.power != power:
+      raise newException(CogiavelliError,
+        "cannot defend foreign unit: " & target)
+    result.targetProvince = province
+    result.targetPower = unit.power
+    result.targetUnit = unitText(unit)
 
 proc parseOrdersReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
   if payload.kind != JObject:
     raise newException(CogiavelliError, "orders reply is not a JSON object")
-  let ordersNode = payload{"orders"}
-  if ordersNode.isNil or ordersNode.kind != JArray:
-    raise newException(CogiavelliError, "orders reply has no orders array")
-  for entry in ordersNode:
-    if result.orders.len >= MaxOrders:
-      break
-    if entry.kind != JString:
-      continue
-    result.orders.add(cleanText(entry.getStr(), MaxOrderLen))
+  if not payload.hasKey("orders") or payload["orders"].kind != JArray:
+    raise newException(CogiavelliError, "orders reply must include an orders array")
+  let ordersNode = payload["orders"]
+  if ordersNode.len > MaxOrders:
+    raise newException(CogiavelliError,
+      "too many orders (max " & $MaxOrders & ")")
   let power = sim.powerOf[seat]
-  let spendNode = payload{"spend"}
-  if not spendNode.isNil and spendNode.kind == JArray:
+  var claimed: array[NumAreas, bool]
+  for entry in ordersNode:
+    if entry.kind != JString:
+      raise newException(CogiavelliError, "every order entry must be a string")
+    let raw = strutils.strip(entry.getStr())
+    var order = parseOrder(sim.board, power, raw)
+    checkLegality(sim.board, order)
+    if order.illegal:
+      raise newException(CogiavelliError,
+        "illegal order '" & raw & "': " & order.why)
+    if claimed[order.unit]:
+      raise newException(CogiavelliError,
+        "duplicate order for unit at " & Provinces[order.unit].code)
+    claimed[order.unit] = true
+    result.orders.add(formatOrder(sim.board, order))
+  for unit in sim.myUnits(power):
+    if not claimed[unit.province]:
+      raise newException(CogiavelliError,
+        "missing order for unit " & unitText(unit))
+  if payload.hasKey("spend"):
+    let spendNode = payload["spend"]
+    if spendNode.kind != JArray:
+      raise newException(CogiavelliError, "spend must be an array")
+    if spendNode.len > MaxSpendEntries:
+      raise newException(CogiavelliError,
+        "too many spend entries (max " & $MaxSpendEntries & ")")
     for entry in spendNode:
-      if result.spend.len >= MaxSpendEntries:
-        break
-      let parsed = parseSpendEntry(sim, power, entry)
-      if parsed.amount == 0:
-        continue
-      result.spend.add(parsed)
-  let buildsNode = payload{"builds"}
-  if not buildsNode.isNil and buildsNode.kind == JArray:
+      result.spend.add(parseSpendEntry(sim, power, entry))
+  if payload.hasKey("builds"):
+    let buildsNode = payload["builds"]
+    if buildsNode.kind != JArray:
+      raise newException(CogiavelliError, "builds must be an array")
+    if buildsNode.len > MaxBuilds:
+      raise newException(CogiavelliError,
+        "too many builds (max " & $MaxBuilds & ")")
+    if sim.season != seAutumn and buildsNode.len > 0:
+      raise newException(CogiavelliError, "builds are only allowed in Autumn")
     for entry in buildsNode:
-      if result.builds.len >= MaxBuilds or entry.kind != JString:
-        continue
-      result.builds.add(cleanText(entry.getStr(), MaxBuildLen))
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+      if entry.kind != JString:
+        raise newException(CogiavelliError, "every build entry must be a string")
+      let raw = strutils.strip(entry.getStr())
+      let tokens = strutils.splitWhitespace(raw.toUpperAscii())
+      if tokens.len != 2 or tokens[0] notin ["A", "F"]:
+        raise newException(CogiavelliError, "invalid build format: " & raw)
+      let province = provinceByCode(tokens[1])
+      if province < 0 or not isCity(province):
+        raise newException(CogiavelliError, "build target is not a city: " & raw)
+      if tokens[0] == "F" and not isCoastal(province):
+        raise newException(CogiavelliError, "fleet build must be in a coastal city: " & raw)
+      result.builds.add(tokens[0] & " " & Provinces[province].code)
+  if payload.hasKey("notes"):
+    if payload["notes"].kind != JString:
+      raise newException(CogiavelliError, "orders notes must be a string")
+    result.notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
 
 proc decisionReply*(decision: Decision, phase: PhaseKind): JsonNode =
   if phase == phPress:
@@ -993,7 +1079,6 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
         client.tryNextBedrockModel("no model access"):
       raise newException(CogiavelliError,
         "bedrock model access denied: " & detail)
-    client.disabled = true
     raise newException(CogiavelliError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
@@ -1013,6 +1098,18 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
     raise newException(CogiavelliError, "reply cut off at max_tokens before " &
       "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
+proc raiseModelFailure(sim: Sim, seat: int, phase: PhaseKind,
+    reason, rawResponse: string) =
+  var err = newException(ModelDecisionError,
+    "model decision failed for seat " & $seat & " (" &
+    PowerNames[sim.powerOf[seat]] & ") in " & $phase & ": " & reason)
+  err.seat = seat
+  err.power = PowerNames[sim.powerOf[seat]]
+  err.phase = phase
+  err.reason = reason
+  err.rawResponse = rawResponse
+  raise err
+
 proc decideAll*(
   client: LlmClient,
   selection: PromptSelection,
@@ -1023,21 +1120,26 @@ proc decideAll*(
   scripted: seq[ScriptKind]
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order, from ONE parallel batch.
-  ## Never raises: any failure falls back to the scripted baseline so the
-  ## episode always advances. `prompts` and `scripted` are indexed by SEAT.
+  ## Explicitly scripted seats run deterministically without an LLM.
+  ## Non-scripted model seats require an LLM transport and raise
+  ## `ModelDecisionError` on failure instead of substituting a scripted action.
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts = newSeq[seq[DecisionAttempt]](Seats)
   result = newSeq[Decision](seats.len)
   var open: seq[int]
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skCondottiere else: kind), phase)
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind, phase)
     else:
+      if client.transport == ltNone:
+        raiseModelFailure(sim, seat, phase,
+          "no LLM transport configured for non-scripted seat", "")
       open.add(index)
+  var lastError = newSeq[string](seats.len)
+  var lastRaw = newSeq[string](seats.len)
   for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
+    if open.len == 0:
       break
     let started = epochTime()
     var batch: RequestBatch
@@ -1048,7 +1150,7 @@ proc decideAll*(
         if phase == phPress: pressPrompt(sim, seat, prompts[seat])
         else: ordersPrompt(sim, seat, prompts[seat])
       if attempt > 0:
-        user.add(InvalidHint)
+        user.add(InvalidHint & " Error: " & lastError[index])
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       if capture:
         pendingEvidence.add(nativeAttempt(sim.config.players[seat].name,
@@ -1061,12 +1163,14 @@ proc decideAll*(
       let seat = seats[index]
       var evidence: DecisionAttempt
       if capture: evidence = pendingEvidence[position]
+      lastRaw[index] = responses[position].response.body
       try:
         if capture:
           evidence.receiveNativeResponse(responses[position].response,
             responses[position].error, latency)
         let text = client.textOf(responses[position].response,
           responses[position].error, batch[position].url)
+        lastRaw[index] = text
         let payload = extractJsonObject(text)
         result[index] =
           if phase == phPress: parsePress(sim, seat, payload)
@@ -1091,12 +1195,14 @@ proc decideAll*(
             evidence.rejectionReason = some("native parser normalized the proposal")
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        lastError[index] = error.msg
         echo "cogiavelli llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         stillOpen.add(index)
       if capture: client.nativeAttempts[seat].add(evidence)
     open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    echo "cogiavelli: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skCondottiere, phase)
+  if open.len > 0:
+    let failedIndex = open[0]
+    let failedSeat = seats[failedIndex]
+    raiseModelFailure(sim, failedSeat, phase,
+      lastError[failedIndex], lastRaw[failedIndex])

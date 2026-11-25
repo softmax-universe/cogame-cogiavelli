@@ -259,11 +259,11 @@ proc runBuilds*(board: var Board, owners: array[TotalCities, int],
   for entry in entries:
     var record = BuildRecord(power: power, entry: entry, applied: false)
     let tokens = entry.strip().toUpperAscii().splitWhitespace()
-    if tokens.len != 2 or tokens[0] notin ["A", "F", "ARMY", "FLEET"]:
+    if tokens.len != 2 or tokens[0] notin ["A", "F"]:
       record.why = "parse"
       result.add(record)
       continue
-    let fleet = tokens[0] in ["F", "FLEET"]
+    let fleet = tokens[0] == "F"
     let province = provinceByCode(tokens[1])
     if province < 0 or not isCity(province):
       record.why = "notacity"
