@@ -65,8 +65,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+fixture_pid=""
 
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then
+    kill "${fixture_pid}" >/dev/null 2>&1 || true
+    wait "${fixture_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +196,34 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+docker_host_args=()
+if [ "$(uname -s)" = "Linux" ]; then
+  docker_host_args+=(--add-host=host.docker.internal:host-gateway)
+fi
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL:-anthropic/claude-haiku-4.5}")
+  echo "COWORLD_LLM_ENDPOINT present: using configured LLM endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  echo "starting local deterministic HTTP model fixture for non-scripted model seats"
+  python3 "${script_dir}/local_llm_fixture.py" 0 "${work_dir}/fixture.port" "${work_dir}/llm_calls.jsonl" &
+  fixture_pid=$!
+  for _ in $(seq 1 50); do
+    if [ -s "${work_dir}/fixture.port" ]; then break; fi
+    sleep 0.1
+  done
+  fixture_port="$(cat "${work_dir}/fixture.port")"
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}")
+  game_env+=(-e "COWORLD_LLM_MODEL=cogiavelli-smoke-fixture")
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  ${docker_host_args[@]+"${docker_host_args[@]}"} \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -282,14 +305,29 @@ if reason is not None:
 replay_path = work / "replay.json"
 if not replay_path.exists() or replay_path.stat().st_size == 0:
     raise SystemExit("replay missing or empty (COGAME_SAVE_REPLAY_URI was file:///coworld/replay.json)")
+replay_data = None
 if require_replay_json:
     try:
-        json.loads(replay_path.read_bytes().decode("utf-8"))
+        replay_data = json.loads(replay_path.read_bytes().decode("utf-8"))
     except Exception as exc:
         raise SystemExit(
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+
+llm_calls_path = work / "llm_calls.jsonl"
+if llm_calls_path.exists():
+    calls = [json.loads(line) for line in llm_calls_path.read_text().splitlines() if line.strip()]
+    if not calls:
+        raise SystemExit("local LLM fixture recorded 0 HTTP calls from model seats")
+    slots_called = sorted({int(c["slot"]) for c in calls})
+    if 0 not in slots_called:
+        raise SystemExit(f"expected slot 0 (cogiavelli-player) to call HTTP, got slots {slots_called}")
+    if replay_data is not None:
+        slot0_press = [e for e in replay_data.get("events", []) if e.get("kind") == "press" and e.get("seat") == 0]
+        if not any(e.get("broadcast", "").startswith("FIXTURE_") for e in slot0_press):
+            raise SystemExit("slot 0 model broadcast from HTTP fixture was not applied in replay")
+    print(f"model HTTP check OK: {len(calls)} calls on slots {slots_called}")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "

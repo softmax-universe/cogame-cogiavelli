@@ -315,7 +315,11 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-cogiavelli/tree/main",
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      }
     },
     {
       "id": "cogiavelli-condottiere",
@@ -461,13 +465,13 @@
     },
     "players": [
       {
+        "player_id": "cogiavelli-player"
+      },
+      {
         "player_id": "cogiavelli-condottiere"
       },
       {
         "player_id": "cogiavelli-banker"
-      },
-      {
-        "player_id": "cogiavelli-condottiere"
       },
       {
         "player_id": "cogiavelli-banker"
