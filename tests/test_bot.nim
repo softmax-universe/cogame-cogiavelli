@@ -262,13 +262,56 @@ block replyParsing:
       "pressPrompt sample letter never targets the acting power itself")
     ## Every seat's ordersPrompt example must be legal for that seat!
     let ordersText = ordersPrompt(sim, s, "")
-    let marker = "Reply with ONLY one JSON object:\n"
+    let marker = "Example reply:\n"
     let startIdx = ordersText.find(marker) + marker.len
     let endIdx = ordersText.find('\n', startIdx)
     let exampleLine = ordersText[startIdx ..< endIdx]
     let parsedExample = parseOrdersReply(sim, s, extractJsonObject(exampleLine))
     check(parsedExample.orders.len == 3,
       "ordersPrompt concrete example is valid and covers every unit for " & pName)
+
+  let turk = sim.seatOf[powerIndex("TURK")]
+  let printed = ordersPrompt(sim, turk, "")
+  for (badOrder, fleetOrder, reason) in [
+      ("A DUR - TUR", "F RAG - LAD", "nonadjacent"),
+      ("A DUR S A AVL - TRI VIA CONVOY", "F RAG S A AVL - TRI VIA CONVOY", "parse")]:
+    check(badOrder notin printed, "the rejected order was not advertised")
+    let payload = %*{"orders": ["A AVL - TRI VIA CONVOY", badOrder, fleetOrder]}
+    try:
+      discard parseOrdersReply(sim, turk, extractJsonObject("```json\n" & $payload & "\n```"))
+      check(false, "the reported Turk submission should fail")
+    except CogiavelliError as error:
+      check(error.msg == "illegal order '" & badOrder & "': " & reason, error.msg)
+
+  var convoySim = sim
+  convoySim.board = newBoard(@[
+    Unit(province: AVL, kind: ukArmy, power: powerIndex("TURK")),
+    Unit(province: LAD, kind: ukFleet, power: powerIndex("TURK")),
+    Unit(province: UAD, kind: ukFleet, power: 0),
+    Unit(province: FRI, kind: ukArmy, power: 0)])
+  let convoyMenu = ordersPrompt(convoySim, convoySim.seatOf[0], "")
+  for order in ["F UAD C A AVL - TRI", "A FRI S A AVL - TRI"]:
+    check(order in convoyMenu, "remote convoy and support are available: " & order)
+  check("A AVL - DUR VIA CONVOY" in printed, "an adjacent coastal move may use a convoy")
+
+  var crowded = sim
+  var units: seq[Unit]
+  for province in 0 ..< NumAreas:
+    units.add(Unit(province: province, power: power,
+      kind: (if isSea(province): ukFleet else: ukArmy)))
+  crowded.board = newBoard(units)
+  let menu = ordersPrompt(crowded, seat, "")
+  let example = menu.split("Example reply:\n")[1].splitLines()[0]
+  var sheet = extractJsonObject(example)
+  let full = parseOrdersReply(crowded, seat, sheet)
+  check(full.orders.len == NumAreas, "a full board can submit its printed example")
+  let choices = legalOrders(crowded.board, LAD)
+  check(choices.len > 64 and choices[^1] in menu, "long menus print their last choice")
+  for i, order in full.orders:
+    if order.startsWith("F LAD "):
+      sheet["orders"].elems[i] = %choices[^1]
+  check(choices[^1] in parseOrdersReply(crowded, seat, sheet).orders,
+    "a choice beyond the former cutoff survives dispatch parsing")
 
   ## Build a valid canonical orders list for `seat` to test strict validation.
   var validOrders = newJArray()

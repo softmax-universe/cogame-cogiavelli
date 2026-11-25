@@ -5,9 +5,11 @@
 The scripted exporter below remains a mechanics smoke test. For real model data,
 set `COGAME_SAVE_TRAJECTORY_URI` on the ordinary game server. The opt-in private
 JSONL artifact records every native press/orders request and returned response,
-platform call ID, actual applied action, and retry/fallback/normalization status.
-Requests still run as one parallel batch per phase, with the existing retry and
-fallback behavior. All private observations are frozen before any seat applies.
+platform call ID, parser acceptance, and the action actually applied. Each active model
+seat sends one request in the phase's parallel batch. All private observations are
+frozen before any seat applies. If a reply is invalid or unavailable, the episode
+fails after collecting the batch. Valid sibling proposals retain their evidence
+with no selected attempt or executed action.
 
 Only unmodified model actions can be selected. Optional omitted JSON fields
 receive their native empty defaults for the equality check; the stored response
@@ -25,10 +27,10 @@ To check the complete production server/player path locally, compile
 python3 tools/test_native_capture.py bin/cogiavelli bin/cogiavelli-player tmp/native-capture
 ```
 
-This retains six complete standard/gunboat games: capture on/off replay and
-outcome parity, retries, fallback, parser/engine normalization, privacy, missing
-usage, and offline fallback. The synthetic provider is system-test evidence,
-not an authentic model teacher. Hosted real-model receipt admission and Qwen
+The fixture checks ordinary and fenced replies, capture on/off replay and outcome
+parity in standard and gunboat, exact HTTP counts per seat and decision, mixed
+batch failures, and offline games with explicit scripted opponents. Its local
+provider supplies synthetic system-test evidence. Hosted real-model receipt admission and Qwen
 training qualification must be measured separately.
 
 The exporter plays ten complete native matches per certified variant.

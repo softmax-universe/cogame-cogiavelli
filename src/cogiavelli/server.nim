@@ -362,16 +362,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       try:
         decisions = decideAll(client, state.selection, simCopy, phase, seats, prompts, kinds)
       except ModelDecisionError as error:
-        let evidence =
-          if error.seat >= 0 and error.seat < client.nativeAttempts.len:
-            client.nativeAttempts[error.seat]
-          else: @[]
-        var obs: JsonNode = nil
+        var evidence: seq[DecisionAttempt]
+        var obs: JsonNode
         if not state.trajectory.isNil:
-          for i, s in seats:
-            if s == error.seat:
-              obs = captureViews[i]
-              break
+          for index, seat in seats:
+            if kinds[seat] != skNone: continue
+            if seat == error.seat:
+              evidence = client.nativeAttempts[seat]
+              obs = captureViews[index]
+            else:
+              state.trajectory.recordFailedDecision(simCopy.events.len, seat,
+                config.players[seat].name, captureViews[index],
+                client.nativeAttempts[seat], state.selection, error.reason,
+                "", peer = true)
         failEpisode(runtimeConfig, error.kind, error.seat, error.power, $error.phase,
           error.reason, error.rawResponse, evidence, obs)
 

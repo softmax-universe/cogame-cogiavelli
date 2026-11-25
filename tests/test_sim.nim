@@ -258,13 +258,13 @@ block spendCapAndOrderCap:
     sheet.add(SpendEntry(power: mine, kind: spGift,
       targetPower: (mine + 1) mod Powers, targetProvince: -1, amount: 1))
   var orders: seq[string]
-  for index in 0 ..< 30:
+  for index in 0 .. MaxOrders:
     orders.add("A VER H")
   sim.applyOrders(seat, orders, sheet, @[], "", false)
   check(sim.spends[mine].len == MaxSpendEntries,
     "a seventh spend entry is dropped")
   check(sim.rawOrders[mine].len == MaxOrders,
-    "a twenty-fifth order string is dropped")
+    "an excess order string is dropped")
 
 block policyNamesNeverReachAPrompt:
   let names = @["Zephyrine", "Quillbottom", "Marchbanks", "Voltaix",
