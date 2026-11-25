@@ -62,7 +62,12 @@ type
     defendAmount*: int         ## banker: ducats per defend entry
     buildTreasury*: int        ## banker: build only from here up
 
+  FailureKind* = enum
+    playerError = "player_error"
+    episodeInconclusive = "episode_inconclusive"
+
   ModelDecisionError* = object of CogiavelliError
+    kind*: FailureKind
     seat*: int
     power*: string
     phase*: PhaseKind
@@ -1099,10 +1104,11 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
       "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
 proc raiseModelFailure(sim: Sim, seat: int, phase: PhaseKind,
-    reason, rawResponse: string) =
+    kind: FailureKind, reason, rawResponse: string) =
   var err = newException(ModelDecisionError,
     "model decision failed for seat " & $seat & " (" &
     PowerNames[sim.powerOf[seat]] & ") in " & $phase & ": " & reason)
+  err.kind = kind
   err.seat = seat
   err.power = PowerNames[sim.powerOf[seat]]
   err.phase = phase
@@ -1133,10 +1139,11 @@ proc decideAll*(
       result[index] = scriptedAction(sim, seat, kind, phase)
     else:
       if client.transport == ltNone:
-        raiseModelFailure(sim, seat, phase,
+        raiseModelFailure(sim, seat, phase, episodeInconclusive,
           "no LLM transport configured for non-scripted seat", "")
       open.add(index)
   var lastError = newSeq[string](seats.len)
+  var lastKind = newSeq[FailureKind](seats.len)
   var lastRaw = newSeq[string](seats.len)
   for attempt in 0 .. 2:
     if open.len == 0:
@@ -1198,6 +1205,10 @@ proc decideAll*(
             evidence.rejectionReason = some("native parser normalized the proposal")
       except CatchableError as error:
         if capture: evidence.rejectionReason = some(error.msg)
+        let reply = responses[position]
+        lastKind[index] = if reply.error.len > 0 or reply.response.code notin 200..299:
+          episodeInconclusive
+        else: playerError
         lastError[index] = error.msg
         echo "cogiavelli llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
@@ -1207,5 +1218,5 @@ proc decideAll*(
   if open.len > 0:
     let failedIndex = open[0]
     let failedSeat = seats[failedIndex]
-    raiseModelFailure(sim, failedSeat, phase,
+    raiseModelFailure(sim, failedSeat, phase, lastKind[failedIndex],
       lastError[failedIndex], lastRaw[failedIndex])

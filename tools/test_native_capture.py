@@ -32,9 +32,15 @@ def make_provider(mode: str, call_log: list):
             assert "PRIVATE_OPERATOR_" + slot in user
             assert all("PRIVATE_OPERATOR_" + str(i) not in user for i in range(6) if str(i) != slot)
             assert "SPECTATOR_POLICY_" not in user and "SPECTATOR_POLICY_" not in body["system"]
+            if mode == "http_error":
+                self.send_error(503, "FIXTURE_PROVIDER_UNAVAILABLE")
+                return
+            if mode == "disconnect":
+                self.close_connection = True
+                return
             retry = "Your previous reply was invalid" in user
             if mode == "always_invalid":
-                text = "RAW_INVALID_MODEL_OUTPUT_12345"
+                text = "HTTP 503: RAW_INVALID_MODEL_OUTPUT_12345"
             elif mode == "illegal_order" and " — LETTERS." not in user:
                 text = json.dumps({"orders": ["A NOT_A_PROVINCE - NOPE"], "spend": [], "notes": "bad"})
             elif year == "1499" and season == "SPRING" and not retry:
@@ -74,14 +80,14 @@ def make_provider(mode: str, call_log: list):
     return Provider
 
 
-def run(game, player, output, variant, name, capture, seat_roles, provider_mode="normal", model_enabled=True, expect_fail=False):
+def run(game, player, output, variant, name, capture, seat_roles, provider_mode="normal", model_enabled=True, expected_kind=None):
     root = output / name
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     seats = 6
     config.update(
         seed=42,
-        years=1 if expect_fail else min(config.get("years", 4), 2),
+        years=1 if expected_kind else min(config.get("years", 4), 2),
         turnDelayMs=0,
         players=[{"name": f"SPECTATOR_POLICY_{i}"} for i in range(seats)],
         llmTimeoutSeconds=5,
@@ -159,20 +165,28 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
-        if expect_fail:
+        if expected_kind:
             assert rc != 0, f"expected non-zero exit for {name}, got 0"
             assert not (root / "results.json").exists(), f"failed episode must not write fake results.json in {name}"
             failure = json.loads((root / "player_failure.json").read_text())
             assert set(failure.keys()) == {"failed_policy_index", "kind", "message"}, failure
-            assert failure["failed_policy_index"] == 0 and failure["kind"] == "player_error"
+            assert failure["failed_policy_index"] == 0 and failure["kind"] == expected_kind, failure
             assert failure["message"]
             if provider_mode == "always_invalid":
                 assert "RAW_INVALID_MODEL_OUTPUT_12345" in failure["message"]
             elif provider_mode == "illegal_order":
                 assert "A NOT_A_PROVINCE - NOPE" in failure["message"]
+            elif provider_mode == "http_error":
+                assert "503" in failure["message"] and "FIXTURE_PROVIDER_UNAVAILABLE" in failure["message"]
+            assert bool(call_log) == model_enabled
             if capture:
                 rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
                 assert rows[-1]["status"] == "failed"
+                assert "scores" not in rows[-1]["outcome"] and rows[-1]["participant_outcomes"] == {}
+                if provider_mode == "http_error":
+                    assert "FIXTURE_PROVIDER_UNAVAILABLE" in rows[-1]["outcome"]["raw_response"]
+                assert rows[-2]["action_status"] == "rejected"
+                assert all(a["origin"] == "model" and not a["accepted"] for a in rows[-2]["attempts"])
             return failure, call_log
 
         assert rc == 0, f"game failed unexpectedly ({rc}); see {root / 'game.log'}"
@@ -180,6 +194,7 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
         results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
         assert results["reason"] in ("complete", "conquest")
+        assert len(results["scores"]) == seats
         model_seats = [i for i, r in enumerate(seat_roles) if not r]
         if model_seats:
             assert len(call_log) > 0, "model seat must actually call HTTP"
@@ -203,7 +218,8 @@ def run(game, player, output, variant, name, capture, seat_roles, provider_mode=
                 if seat_roles[event["seat"]]:
                     assert row["attempts"][0]["origin"] == "unknown"
                 else:
-                    assert row["attempts"][-1]["origin"] == "model"
+                    assert all(a["origin"] == "model" for a in row["attempts"])
+                    assert row["attempts"][-1]["accepted"]
                     assert row["attempts"][-1]["platform_call_id"] is not None
         return results, replay
     finally:
@@ -237,19 +253,23 @@ def main():
 
     # 2. Explicit failure when model returns invalid output twice (preserves raw data, no fallback)
     run(game, player, destination, manifest["variants"][0], "fail-invalid-reply", True, mixed_roles,
-        provider_mode="always_invalid", expect_fail=True)
+        provider_mode="always_invalid", expected_kind="player_error")
 
     # 3. Explicit failure when model returns illegal order (preserves raw data, no silent hold/fallback)
     run(game, player, destination, manifest["variants"][1], "fail-illegal-order", True, mixed_roles,
-        provider_mode="illegal_order", expect_fail=True)
+        provider_mode="illegal_order", expected_kind="player_error")
 
     # 4. Explicit failure when model seat has no LLM transport configured (no offline fallback)
     run(game, player, destination, manifest["variants"][0], "fail-no-transport", True, mixed_roles,
-        model_enabled=False, expect_fail=True)
+        model_enabled=False, expected_kind="episode_inconclusive")
+
+    for mode in ("http_error", "disconnect"):
+        run(game, player, destination, manifest["variants"][0], f"fail-{mode}", True, mixed_roles,
+            provider_mode=mode, expected_kind="episode_inconclusive")
 
     # 5. Explicit baseline-only game completes offline without LLM credentials
     run(game, player, destination, manifest["variants"][0], "baselines-offline", True, baseline_roles,
-        model_enabled=False, expect_fail=False)
+        model_enabled=False)
 
     print("native server/player verification passed: HTTP model vs baselines, retries, explicit failures, offline baselines")
 

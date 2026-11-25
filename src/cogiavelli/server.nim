@@ -215,7 +215,7 @@ proc phaseLabel(sim: Sim): string =
   seasonName(sim.season) & " " & $sim.year & " " &
     (if sim.phase == phPress: "letters" else: "orders")
 
-proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, power, phase,
+proc failEpisode(runtimeConfig: RuntimeConfig, kind: FailureKind, seat: int, power, phase,
     reason, rawResponse: string, evidence: seq[DecisionAttempt] = @[],
     observation: JsonNode = nil) =
   discard runtimeConfig
@@ -233,7 +233,7 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, power, phase,
       (if rawResponse.len > 0: " | raw_response=" & rawResponse else: "")
     failureJson = %*{
       "failed_policy_index": max(seat, 0),
-      "kind": "player_error",
+      "kind": $kind,
       "message": cleanText(detail, 1900)
     }
     if not state.trajectory.isNil and seat >= 0:
@@ -298,7 +298,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           config.tokens.len, " players connected"
         state.broadcastLocked()
     if regErrSeat >= 0:
-      failEpisode(runtimeConfig, regErrSeat,
+      failEpisode(runtimeConfig, playerError, regErrSeat,
         PowerNames[state.sim.powerOf[regErrSeat]], "registration", regErrMsg, "")
 
     let client = newLlmClient(config)
@@ -372,7 +372,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if s == error.seat:
               obs = captureViews[i]
               break
-        failEpisode(runtimeConfig, error.seat, error.power, $error.phase,
+        failEpisode(runtimeConfig, error.kind, error.seat, error.power, $error.phase,
           error.reason, error.rawResponse, evidence, obs)
 
       withLock stateLock:
@@ -397,7 +397,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               else: @[]
             let obs = if not state.trajectory.isNil: captureViews[index] else: nil
             stateLock.release()
-            failEpisode(runtimeConfig, seat, PowerNames[simCopy.powerOf[seat]],
+            failEpisode(runtimeConfig, playerError, seat, PowerNames[simCopy.powerOf[seat]],
               $phase, error.msg, $decision.decisionReply(phase), evidence, obs)
           if not state.trajectory.isNil:
             let applied = state.sim.events[eventIndex]
