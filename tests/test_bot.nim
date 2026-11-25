@@ -29,7 +29,7 @@ type Audit = object
 
 proc play(config: GameConfig, kinds: seq[ScriptKind]): Audit =
   var sim = initSim(config)
-  var client = LlmClient(disabled: true)
+  var client = LlmClient(transport: ltNone)
   let prompts = newSeq[string](6)
   var calls = 0
   var guard = 0
@@ -43,7 +43,7 @@ proc play(config: GameConfig, kinds: seq[ScriptKind]): Audit =
       if sim.done:
         break
       let decision = decisions[index]
-      check(decision.scripted, "a disabled client always answers scripted")
+      check(decision.scripted, "an explicit scripted seat always answers scripted")
       if phase == phOrders:
         check(decision.spend.len <= MaxSpendEntries,
           "no spend array exceeds six entries")
@@ -162,21 +162,32 @@ block aBaselineThatCannotBeatAWallIsNoBaseline:
       "the condottiere must end with more cities than every banker: " &
         $expander & " vs " & $sim.cities(seat))
 
-block noNetworkWithoutCredentials:
+block explicitScriptedNeedsNoNetworkAndModelFailsWithoutTransport:
   let config = newConfig(2, 1, false)
   var sim = initSim(config)
-  ## A client with no transport at all: any network call would crash on the
-  ## nil Curly handle, so reaching the end proves none was made.
-  var client = LlmClient(disabled: true)
-  var kinds: seq[ScriptKind]
+  ## A client with no transport at all: explicit scripted seats succeed without
+  ## touching any network handle, while an unscripted model seat MUST fail
+  ## explicitly with ModelDecisionError (no silent scripted fallback).
+  var client = LlmClient(transport: ltNone)
+  var scriptedKinds: seq[ScriptKind]
   for index in 0 ..< 6:
-    kinds.add(skNone)
+    scriptedKinds.add(if index mod 2 == 0: skCondottiere else: skBanker)
   let decisions = decideAll(client, PromptSelection(), sim, sim.phase, sim.pendingSeats(),
-    newSeq[string](6), kinds)
-  check(decisions.len == 6, "six decisions come back")
+    newSeq[string](6), scriptedKinds)
+  check(decisions.len == 6, "six explicit scripted decisions come back")
   for decision in decisions:
     check(decision.scripted, "every one of them is scripted")
     check(decision.orders.len > 0, "and carries real orders")
+
+  var modelKinds = scriptedKinds
+  modelKinds[0] = skNone
+  var failed = false
+  try:
+    discard decideAll(client, PromptSelection(), sim, sim.phase, sim.pendingSeats(),
+      newSeq[string](6), modelKinds)
+  except ModelDecisionError as error:
+    failed = error.seat == 0
+  check(failed, "an unscripted model seat with no transport raises ModelDecisionError")
 
 block finishesFast:
   var kinds: seq[ScriptKind]
@@ -196,23 +207,44 @@ block finishesFast:
 block replyParsing:
   var sim = initSim(newConfig(7, 2, true))
   let seat = 0
+  let power = sim.powerOf[seat]
+  let rival = PowerNames[(power + 1) mod Powers]
+
+  ## Canonical PLAYER_SCRIPTED values only; aliases are rejected.
+  check(parseScriptKind("") == skNone, "empty string means model seat")
+  check(parseScriptKind("condottiere") == skCondottiere, "condottiere parses")
+  check(parseScriptKind("banker") == skBanker, "banker parses")
+  for alias in ["1", "true", "yes", "miser", "unknown"]:
+    var bad = false
+    try:
+      discard parseScriptKind(alias)
+    except CogiavelliError:
+      bad = true
+    check(bad, "scripted alias is rejected: " & alias)
 
   let fenced = "```json\n{\"broadcast\": \"peace\", \"notes\": \"x\"}\n```"
   let press = parsePress(sim, seat, extractJsonObject(fenced))
-  check(press.broadcast == "peace", "fenced JSON is accepted")
+  check(press.broadcast == "peace", "standard outer markdown JSON fence is accepted")
 
-  let bomAndBraces = "\xEF\xBB\xBF```json\n" &
-    "{\"broadcast\": \"hold {VEN} and \\\"}\\\"\", \"notes\": \"plan {1}\"}\n```\n" &
-    "Trailing commentary with {braces} and extra }."
-  let pressBom = parsePress(sim, seat, extractJsonObject(bomAndBraces))
+  let bomFenced = "\xEF\xBB\xBF```json\n" &
+    "{\"broadcast\": \"hold {VEN} and \\\"}\\\"\", \"notes\": \"plan {1}\"}\n```"
+  let pressBom = parsePress(sim, seat, extractJsonObject(bomFenced))
   check(pressBom.broadcast == "hold {VEN} and \"}\"",
-    "BOM, fences, escaped quotes/braces, and trailing {braces} are handled")
-  check(pressBom.notes == "plan {1}",
-    "notes survive trailing braces outside the first object")
+    "BOM and outer markdown fence are handled")
+  check(pressBom.notes == "plan {1}", "notes parse cleanly")
 
-  let prose = "Here is my move.\n{\"orders\": [\"A VER H\"]}\nThat is all."
-  var orders = parseOrdersReply(sim, seat, extractJsonObject(prose))
-  check(orders.orders == @["A VER H"], "prose-wrapped JSON is accepted")
+  for badText in [
+    "Here is my move.\n{\"orders\": [\"A VER H\"]}\nThat is all.",
+    "```json\n{\"broadcast\": \"hi\"}\n```\nTrailing commentary.",
+    "{\"orders\": [\"A VER H\"]",
+    "no json here at all"
+  ]:
+    var rejected = false
+    try:
+      discard extractJsonObject(badText)
+    except CogiavelliError:
+      rejected = true
+    check(rejected, "non-object / prose-wrapped reply is rejected: " & badText)
 
   for pad in 150 .. 165:
     let nonJson = "Refusal " & repeat("a", pad) & "é tail"
@@ -223,63 +255,85 @@ block replyParsing:
       utf8Ok = validateUtf8(error.msg) == -1
     check(utf8Ok, "no-JSON error preview is cut on a rune boundary")
 
-  var unbalanced = false
-  try:
-    discard extractJsonObject("{\"orders\": [\"A VER H\"]")
-  except CogiavelliError:
-    unbalanced = true
-  check(unbalanced, "an unbalanced JSON object raises CogiavelliError")
-
   for s in 0 ..< Seats:
-    let power = PowerNames[sim.powerOf[s]]
+    let pName = PowerNames[sim.powerOf[s]]
     let pressText = pressPrompt(sim, s, "")
-    check("{\"to\":\"" & power & "\"" notin pressText,
+    check("{\"to\":\"" & pName & "\"" notin pressText,
       "pressPrompt sample letter never targets the acting power itself")
+    ## Every seat's ordersPrompt example must be legal for that seat!
+    let ordersText = ordersPrompt(sim, s, "")
+    let marker = "Reply with ONLY one JSON object:\n"
+    let startIdx = ordersText.find(marker) + marker.len
+    let endIdx = ordersText.find('\n', startIdx)
+    let exampleLine = ordersText[startIdx ..< endIdx]
+    let parsedExample = parseOrdersReply(sim, s, extractJsonObject(exampleLine))
+    check(parsedExample.orders.len == 3,
+      "ordersPrompt concrete example is valid and covers every unit for " & pName)
 
-  var raised = false
-  try:
-    discard parseOrdersReply(sim, seat, parseJson("""{"spend": []}"""))
-  except CogiavelliError:
-    raised = true
-  check(raised, "a missing orders key is an INVALID reply, so it is retried")
+  ## Build a valid canonical orders list for `seat` to test strict validation.
+  var validOrders = newJArray()
+  for unit in sim.board.units:
+    if unit.power == power:
+      validOrders.add(%(unitText(unit) & " H"))
+  let baseReply = %*{"orders": validOrders, "spend": [], "notes": "ok"}
+  let okOrders = parseOrdersReply(sim, seat, baseReply)
+  check(okOrders.orders.len == validOrders.len, "canonical orders reply parses")
 
-  raised = false
-  try:
-    discard parsePress(sim, seat, parseJson("""{"notes": "hi"}"""))
-  except CogiavelliError:
-    raised = true
-  check(raised, "press with neither broadcast nor letters is invalid")
+  ## Optional fields (`spend`, `builds`, `notes`) may be omitted.
+  let minimalOrders = parseOrdersReply(sim, seat, %*{"orders": validOrders})
+  check(minimalOrders.orders.len == validOrders.len and minimalOrders.spend.len == 0,
+    "omitted optional fields use documented empty defaults")
 
-  var long = "A VER - "
-  for index in 0 ..< 80:
-    long.add("X")
-  orders = parseOrdersReply(sim, seat,
-    parseJson("""{"orders": ["""" & long & """"]}"""))
-  check(orders.orders[0].runeLen == MaxOrderLen,
-    "an oversize order string is truncated, not rejected")
+  proc expectOrdersError(payload: JsonNode, label: string) =
+    var raised = false
+    try:
+      discard parseOrdersReply(sim, seat, payload)
+    except CogiavelliError:
+      raised = true
+    check(raised, label)
 
-  orders = parseOrdersReply(sim, seat, parseJson(
-    """{"orders": [], "spend": [{"action":"gift","target":"MILAN",
-       "amount":"lots"}]}"""))
-  check(orders.spend.len == 0, "a non-integer amount drops the entry")
+  expectOrdersError(parseJson("""{"spend": []}"""),
+    "a missing orders key is invalid")
+  expectOrdersError(parseJson("""{"orders": []}"""),
+    "omitting owned units is rejected rather than silently holding")
+  expectOrdersError(%*{"orders": ["A NOT_A_PROVINCE - NOPE"]},
+    "illegal order is rejected rather than silently holding")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "gift", "target": rival, "amount": "lots"}]},
+    "a string amount is rejected")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "gift", "target": rival, "amount": 5.5}]},
+    "a float amount is rejected")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "burn", "target": rival, "amount": 5}]},
+    "an unknown spend action is rejected")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "gift", "target": "NOWHERE", "amount": 5}]},
+    "an unresolvable target is rejected")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "assassinate", "target": rival, "amount": 2}]},
+    "out-of-range assassinate amount is rejected rather than clamped")
+  expectOrdersError(%*{"orders": validOrders, "spend": [
+    {"action": "gift", "target": "THE " & rival, "amount": 5}]},
+    "non-canonical power alias is rejected")
 
-  orders = parseOrdersReply(sim, seat, parseJson(
-    """{"orders": [], "spend": [{"action":"burn","target":"MILAN",
-       "amount":5}]}"""))
-  check(orders.spend.len == 0, "an unknown spend action drops the entry")
+  ## Press strict validation
+  proc expectPressError(payload: JsonNode, label: string) =
+    var raised = false
+    try:
+      discard parsePress(sim, seat, payload)
+    except CogiavelliError:
+      raised = true
+    check(raised, label)
 
-  orders = parseOrdersReply(sim, seat, parseJson(
-    """{"orders": [], "spend": [{"action":"gift","target":"MILAN",
-       "amount":5},{"action":"gift","target":"NOWHERE","amount":5}]}"""))
-  check(orders.spend.len == 2, "an unresolvable target is kept and dropped " &
-    "later with a reason")
-  check(orders.spend[1].why == "notarget", "and the reason is notarget")
-
-  raised = false
-  try:
-    discard extractJsonObject("no json here at all")
-  except CogiavelliError:
-    raised = true
-  check(raised, "a reply with no object at all is invalid")
+  expectPressError(parseJson("""{"notes": "hi"}"""),
+    "press with neither broadcast nor letters is invalid")
+  expectPressError(%*{"broadcast": "", "letters": [{"to": "NOWHERE", "text": "hi"}]},
+    "letter to unknown power is rejected")
+  expectPressError(%*{"broadcast": "", "letters": [
+    {"to": rival, "text": "a"}, {"to": rival, "text": "b"}]},
+    "duplicate letter target is rejected")
+  expectPressError(%*{"broadcast": "", "pledges": [{"kind": "truce", "to": rival}]},
+    "unknown pledge kind is rejected")
 
 echo "test_bot: ok"

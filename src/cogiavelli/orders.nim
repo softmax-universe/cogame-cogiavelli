@@ -4,10 +4,9 @@
 ##   A VER H              A VER - MAN            A BAR - PAL VIA CONVOY
 ##   F VEN S A PAD - FER  F VEN S A PAD          F LAD C A BAR - RAG
 ##
-## Parsing is whitespace- and case-tolerant and accepts `-`, `–`, `—` and
-## `->` for a move, `S`/`SUPPORT`, `C`/`CONVOY`, `H`/`HOLD`/`HOLDS`.
-## Nothing else. An order that does not fit comes back `illegal` with a
-## one-word `why`; it never invalidates the rest of a reply.
+## Canonical notation only: A/F unit kind, three-letter province codes,
+## H / - / S / C, and VIA CONVOY. An order that does not fit comes back
+## `illegal` with a one-word `why`.
 
 import std/strutils, types
 
@@ -74,50 +73,31 @@ proc formatOrder*(board: Board, order: Order): string =
   formatOrder(order, kind, auxKind)
 
 proc normalise(raw: string): seq[string] =
-  var text = raw.toUpperAscii()
-  text = text.replace("\u2013", "-").replace("\u2014", "-")
-    .replace("\u2212", "-")
-  text = text.replace("->", "-").replace("=>", "-")
-  var spaced = ""
-  for ch in text:
-    if ch == '-':
-      spaced.add(' ')
-      spaced.add('-')
-      spaced.add(' ')
-    elif ch in {'.', ',', ';', ':', '(', ')', '"', '\'', '*'}:
-      spaced.add(' ')
-    else:
-      spaced.add(ch)
-  spaced.splitWhitespace()
+  raw.strip().toUpperAscii().splitWhitespace()
 
 proc kindFromToken(token: string): int =
   ## 0 = army, 1 = fleet, -1 = not a unit token.
   case token
-  of "A", "ARMY": 0
-  of "F", "FLEET": 1
+  of "A": 0
+  of "F": 1
   else: -1
 
 proc parseUnitRef*(board: Board, text: string): int =
   ## `"A ROM"` -> the province of the unit standing in Rome, or -1 when
   ## there is none, the kind letter disagrees, or the reference is not a
-  ## unit reference at all. A bare province code also resolves.
+  ## canonical `<A|F> <CODE>` unit reference.
   let tokens = normalise(text)
-  if tokens.len == 0 or tokens.len > 2:
+  if tokens.len != 2:
     return -1
-  var wanted = -1
-  var codeToken = tokens[0]
-  if tokens.len == 2:
-    wanted = kindFromToken(tokens[0])
-    if wanted < 0:
-      return -1
-    codeToken = tokens[1]
-  let province = provinceByCode(codeToken)
+  let wanted = kindFromToken(tokens[0])
+  if wanted < 0:
+    return -1
+  let province = provinceByCode(tokens[1])
   if province < 0 or not board.hasUnit(province):
     return -1
-  if wanted >= 0:
-    let kind = board.unitAt(province).kind
-    if (wanted == 1) != (kind == ukFleet):
-      return -1
+  let kind = board.unitAt(province).kind
+  if (wanted == 1) != (kind == ukFleet):
+    return -1
   province
 
 proc parseOrder*(board: Board, power: int, raw: string): Order =
@@ -133,7 +113,7 @@ proc parseOrder*(board: Board, power: int, raw: string): Order =
     order.why = why
     order
   let tokens = normalise(raw)
-  if tokens.len < 2:
+  if tokens.len < 3:
     return bad("parse")
   if kindFromToken(tokens[0]) < 0:
     return bad("parse")
@@ -159,76 +139,59 @@ proc parseOrder*(board: Board, power: int, raw: string): Order =
     order.why = why
     order
 
-  if tokens.len == 2:
-    result.kind = okHold
-    return
   case tokens[2]
-  of "H", "HOLD", "HOLDS", "STAND", "STANDS":
+  of "H":
     if tokens.len != 3:
       return badAt("parse")
     result.kind = okHold
   of "-":
-    if tokens.len < 4:
+    if tokens.len != 4 and tokens.len != 6:
       return badAt("parse")
     let dest = provinceByCode(tokens[3])
     if dest < 0:
       return badAt("parse")
     result.kind = okMove
     result.target = dest
-    if tokens.len > 4:
-      let tail = tokens[4 .. ^1].join(" ")
-      if tail == "VIA CONVOY" or tail == "VIA" or tail == "BY CONVOY" or
-          tail == "CONVOY":
+    if tokens.len == 6:
+      if tokens[4] == "VIA" and tokens[5] == "CONVOY":
         result.viaConvoy = true
       else:
         return badAt("parse")
-  of "S", "SUPPORT", "SUPPORTS":
-    var pos = 3
-    if pos < tokens.len and kindFromToken(tokens[pos]) >= 0:
-      pos.inc
-    if pos >= tokens.len:
+  of "S":
+    if tokens.len != 5 and tokens.len != 7:
       return badAt("parse")
-    let from0 = provinceByCode(tokens[pos])
+    let auxKind = kindFromToken(tokens[3])
+    if auxKind < 0:
+      return badAt("parse")
+    let from0 = provinceByCode(tokens[4])
     if from0 < 0:
       return badAt("parse")
-    pos.inc
+    if board.hasUnit(from0) and
+        (board.unitAt(from0).kind == ukFleet) != (auxKind == 1):
+      return badAt("wrongunit")
     result.auxFrom = from0
-    if pos >= tokens.len:
+    if tokens.len == 5:
       result.kind = okSupportHold
       return
-    if tokens[pos] != "-":
+    if tokens[5] != "-":
       return badAt("parse")
-    pos.inc
-    if pos >= tokens.len:
-      return badAt("parse")
-    let to0 = provinceByCode(tokens[pos])
+    let to0 = provinceByCode(tokens[6])
     if to0 < 0:
-      return badAt("parse")
-    pos.inc
-    if pos != tokens.len:
       return badAt("parse")
     result.kind = okSupportMove
     result.auxTo = to0
-  of "C", "CONVOY", "CONVOYS":
-    var pos = 3
-    if pos < tokens.len and kindFromToken(tokens[pos]) >= 0:
-      pos.inc
-    if pos >= tokens.len:
+  of "C":
+    if tokens.len != 7:
       return badAt("parse")
-    let from0 = provinceByCode(tokens[pos])
+    if kindFromToken(tokens[3]) != 0:
+      return badAt("wrongunit")
+    let from0 = provinceByCode(tokens[4])
     if from0 < 0:
       return badAt("parse")
-    pos.inc
-    if pos >= tokens.len or tokens[pos] != "-":
+    if tokens[5] != "-":
       return badAt("parse")
-    pos.inc
-    if pos >= tokens.len:
-      return badAt("parse")
-    let to0 = provinceByCode(tokens[pos])
+    let to0 = provinceByCode(tokens[6])
     if to0 < 0:
-      return badAt("parse")
-    pos.inc
-    if pos != tokens.len:
       return badAt("parse")
     result.kind = okConvoy
     result.auxFrom = from0

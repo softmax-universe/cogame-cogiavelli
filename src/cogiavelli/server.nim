@@ -51,6 +51,8 @@ type
     trajectory: DecisionTrajectory
     prompts: seq[string]
     scripted: seq[ScriptKind]
+    promptDelivered: seq[bool]
+    registrationErrors: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -213,6 +215,59 @@ proc phaseLabel(sim: Sim): string =
   seasonName(sim.season) & " " & $sim.year & " " &
     (if sim.phase == phPress: "letters" else: "orders")
 
+proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, power, phase,
+    reason, rawResponse: string, evidence: seq[DecisionAttempt] = @[],
+    observation: JsonNode = nil) =
+  discard runtimeConfig
+  var failureJson: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let policyName =
+      if seat >= 0 and seat < state.config.players.len:
+        state.config.players[seat].name
+      else: ""
+    failureJson = %*{
+      "seat": seat,
+      "slot": seat,
+      "power": power,
+      "policy": policyName,
+      "phase": phase,
+      "year": state.sim.year,
+      "season": $state.sim.season,
+      "reason": reason,
+      "raw_response": rawResponse
+    }
+    if not state.trajectory.isNil and seat >= 0:
+      let obs = if observation.isNil: state.sim.observationJson(seat) else: observation
+      state.trajectory.recordFailedDecision(state.sim.events.len, seat,
+        policyName, obs, evidence, state.selection, reason, rawResponse)
+      state.trajectory.failNativeTrajectory(seat, reason, rawResponse)
+    let errorFrame = %*{
+      "type": "final",
+      "done": true,
+      "failed": true,
+      "seat": seat,
+      "power": power,
+      "reason": reason
+    }
+    for slot, socket in state.playerSockets:
+      try:
+        socket.send($errorFrame)
+      except CatchableError:
+        discard
+  echo "cogiavelli: episode failed for seat ", seat, " (", power, "): ", reason
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(failureUri, $failureJson, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+    except CatchableError as error:
+      echo "cogiavelli: failed to write COGAME_PLAYER_FAILURE_URI: ", error.msg
+  sleep(200)
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -220,18 +275,34 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let connectDeadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < connectDeadline:
-      var allConnected = false
+      var allReady = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        if state.playerSockets.len >= config.tokens.len:
+          allReady = true
+          for slot in 0 ..< config.tokens.len:
+            if not state.promptDelivered[slot]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(100)
 
+    var regErrSeat = -1
+    var regErrMsg = ""
     withLock stateLock:
-      state.started = true
-      echo "cogiavelli: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+      for slot in 0 ..< config.tokens.len:
+        if state.registrationErrors[slot].len > 0:
+          regErrSeat = slot
+          regErrMsg = state.registrationErrors[slot]
+          break
+      if regErrSeat < 0:
+        state.started = true
+        echo "cogiavelli: starting with ", state.playerSockets.len, "/",
+          config.tokens.len, " players connected"
+        state.broadcastLocked()
+    if regErrSeat >= 0:
+      failEpisode(runtimeConfig, regErrSeat,
+        PowerNames[state.sim.powerOf[regErrSeat]], "registration", regErrMsg, "")
 
     let client = newLlmClient(config)
 
@@ -290,7 +361,22 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var captureViews: seq[JsonNode]
       if not state.trajectory.isNil:
         for seat in seats: captureViews.add(simCopy.observationJson(seat))
-      let decisions = decideAll(client, state.selection, simCopy, phase, seats, prompts, kinds)
+      var decisions: seq[Decision]
+      try:
+        decisions = decideAll(client, state.selection, simCopy, phase, seats, prompts, kinds)
+      except ModelDecisionError as error:
+        let evidence =
+          if error.seat >= 0 and error.seat < client.nativeAttempts.len:
+            client.nativeAttempts[error.seat]
+          else: @[]
+        var obs: JsonNode = nil
+        if not state.trajectory.isNil:
+          for i, s in seats:
+            if s == error.seat:
+              obs = captureViews[i]
+              break
+        failEpisode(runtimeConfig, error.seat, error.power, $error.phase,
+          error.reason, error.rawResponse, evidence, obs)
 
       withLock stateLock:
         echo "cogiavelli: ", phaseLabel(state.sim), " — ", seats.len,
@@ -308,15 +394,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               state.sim.applyOrders(seat, decision.orders, decision.spend,
                 decision.builds, decision.notes, decision.scripted)
           except CogiavelliError as error:
-            echo "cogiavelli: reply rejected (", error.msg,
-              "); using scripted fallback"
-            let fallback = scriptedAction(state.sim, seat, skCondottiere,
-              phase)
-            if phase == phPress:
-              state.sim.applyPress(seat, "", @[], @[], "", true)
-            else:
-              state.sim.applyOrders(seat, fallback.orders, fallback.spend,
-                fallback.builds, "", true)
+            let evidence =
+              if seat >= 0 and seat < client.nativeAttempts.len:
+                client.nativeAttempts[seat]
+              else: @[]
+            let obs = if not state.trajectory.isNil: captureViews[index] else: nil
+            stateLock.release()
+            failEpisode(runtimeConfig, seat, PowerNames[simCopy.powerOf[seat]],
+              $phase, error.msg, $decision.decisionReply(phase), evidence, obs)
           if not state.trajectory.isNil:
             let applied = state.sim.events[eventIndex]
             state.trajectory.recordAppliedDecision(eventIndex, seat,
@@ -450,17 +535,27 @@ proc websocketHandler(
           if prompt.len > MaxPromptLen:
             prompt = cleanText(prompt, MaxPromptLen)
           let node = payload{"scripted"}
-          let kind =
-            if node.isNil: skNone
-            elif node.kind == JBool:
-              (if node.getBool(): skCondottiere else: skNone)
-            else: parseScriptKind(node.getStr())
+          var kind = skNone
+          var regErr = ""
+          if not node.isNil and node.kind != JNull:
+            if node.kind != JString:
+              regErr = "prompt frame 'scripted' must be a string"
+            else:
+              try:
+                kind = parseScriptKind(node.getStr())
+              except CogiavelliError as error:
+                regErr = error.msg
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = kind
-          echo "cogiavelli: slot ", slot, " delivered a prompt (",
-            prompt.len, " chars",
-            (if kind != skNone: ", scripted " & $kind else: ""), ")"
+            state.registrationErrors[slot] = regErr
+            state.promptDelivered[slot] = true
+          if regErr.len > 0:
+            echo "cogiavelli: slot ", slot, " invalid registration: ", regErr
+          else:
+            echo "cogiavelli: slot ", slot, " delivered a prompt (",
+              prompt.len, " chars",
+              (if kind != skNone: ", scripted " & $kind else: ""), ")"
       except CatchableError as error:
         echo "cogiavelli: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -534,6 +629,8 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.trajectory = initNativeTrajectory(config)
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
+  state.promptDelivered = newSeq[bool](config.players.len)
+  state.registrationErrors = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)
